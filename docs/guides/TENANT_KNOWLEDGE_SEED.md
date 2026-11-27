@@ -1,29 +1,21 @@
 # Seeding a New Tenant with the Study Notes Knowledge Base
 
 This guide documents how to provision a new multi-tenant LunarWing instance so
-that it starts with the **entire contents** of the project's shared study-notes
+that it imports eligible notes from the project's shared study-notes
 knowledge base — the [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.git)
 study-notes MCP checkout — imported into the tenant's own, private knowledge
 store on first boot.
 
-Seeding is designed for **new tenants only**. It runs exactly once and never
-overwrites anything. Tenants provisioned with `--with-study-mcp` also opt in to
-a separate additive refresh cadence that imports newly published paths without
-changing existing notes. Existing tenants upgraded to a seed-capable binary are
+Seeding is designed for **new tenants only**. A completed bootstrap pass is
+recorded in a state file. Tenants provisioned with `--with-study-mcp` also opt
+in to a separate additive refresh cadence that imports newly published paths.
+Both passes preserve existing notes, with the repair cases listed below. Existing tenants upgraded to a seed-capable binary are
 neither seeded nor opted in automatically.
-
-**Revalidated against source 2026-11-20 at `9c96220bb2`.** The seeding and additive
-refresh flows are unchanged. The stale-marking sweep has no 1,000-note scan cap:
-`knowledge_list_notes` pages the whole store with a keyset cursor (500-row
-pages, 100k safety ceiling), and the independent `KNOWLEDGE_SWEEP_ENABLED`
-cadence still runs when mt-admin renders `HEARTBEAT_ENABLED=false`. A seeded
-tenant's full corpus is therefore sweepable; the roughly 1,250-note figure below
-is only the August 2026 snapshot, not a fixed corpus size.
 
 ## What the tenant gets
 
-A seeded tenant's private knowledge store contains every note from the shared
-[lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.git) checkout (roughly
+A seeded tenant's private knowledge store contains the notes successfully imported
+from the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.git) checkout (roughly
 1,250 curated codebase-study notes as of the August 2026 verification run),
 imported into its own workspace as `study-notes/<agent>/<topic>.md` documents
 with the canonical study-notes metadata preserved (status, confidence, studied
@@ -147,9 +139,10 @@ ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
    that is refused or fails changes neither the schedule nor the staged copy.
    `doctor` reports
    the staged commit and flags a snapshot that has outlived its schedule.
-3. Each tenant daemon independently checks on its configured cadence (six hours
-   by default, with deterministic startup jitter). When the revision changes it
-   scans the checkout and imports only missing paths.
+3. Each enabled tenant daemon independently checks on its configured cadence
+   (six hours by default, with deterministic startup jitter). When the revision
+   changes it scans the checkout to import missing paths and repair eligible
+   existing rows.
 4. The daemon writes `knowledge_sync_state.json` under its state directory with
    the completed revision, attempt/success timestamps, backoff state, and last
    run counts. A cross-process lock collapses daemon and CLI runs.
@@ -186,12 +179,11 @@ without importing directly, run `sync-knowledge-sources`.
   (`knowledge_seed_state.json`, see below) is written once the pass has walked
   every discovered note; later startups skip that bootstrap entirely. The
   separate refresh cadence can still add paths published afterward.
-- **Never overwrites.** Both bootstrap and refresh skip a note whose workspace path already exists
-  byte-for-byte, so operator-authored notes survive even a forced re-seed. The
-  only writes to existing paths repair a previous seed pass's own stranded
-  rows (a byte-for-byte seeded body missing provenance metadata gets the
-  metadata restored; an empty placeholder row from a mid-pass crash gets
-  filled). Operator content never matches those shapes byte-for-byte.
+- **Existing rows and repair.** Both passes skip an existing path with parseable
+  knowledge-note metadata regardless of its body. Without that metadata, a body
+  that exactly matches the rendered seed note gets a metadata-only repair. A
+  whitespace-only body is filled with the seed note and given metadata, including
+  an empty row created by an operator. Other bodies are left alone.
 - **Wire namespace stays reserved.** Checkout directories under the
   coordination wire prefix (`coord-*`) are never imported, so seeded notes
   cannot collide with coordination wire notes. Dotfiles, non-Markdown files,
