@@ -77,8 +77,8 @@ RUN set -eu; \
       'npm ci --omit=dev --prefix /opt/kimi-cli'; \
     node /build/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli
 RUN --network=none KIMI_WORKER_TEST_BUNDLE=/opt/kimi-cli/node_modules/@moonshot-ai/kimi-code/dist/main.mjs \
-    PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
-    --test-name-pattern "real CLI"
+    KIMI_BIN=/opt/kimi-cli/node_modules/.bin/kimi \
+    node --test --test-timeout=120000 /build/scripts/kimi_cli_contract_test.js
 
 # ──────────────────────────────
 # Stage 2: runtime image
