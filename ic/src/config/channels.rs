@@ -63,9 +63,7 @@ pub struct GatewayConfig {
     pub workspace_read_scopes: Vec<String>,
     /// Memory layer definitions (JSON in env var, or from external config).
     pub memory_layers: Vec<crate::workspace::layer::MemoryLayer>,
-    /// Multi-user token map. When set, each token maps to a user identity.
-    /// Parsed from `GATEWAY_USER_TOKENS` (JSON string). When absent, falls back
-    /// to single-user mode via `auth_token` + `user_id`.
+    /// Legacy multi-user token map; rejected by daemon configuration.
     pub user_tokens: Option<HashMap<String, UserTokenConfig>>,
     /// WebSocket ping interval in seconds (default: 30).
     pub ws_ping_interval_secs: u64,
@@ -151,6 +149,15 @@ pub struct XmppConfig {
 
 impl ChannelsConfig {
     pub(crate) fn resolve(settings: &Settings, owner_id: &str) -> Result<Self, ConfigError> {
+        if !matches!(optional_env("GATEWAY_USER_TOKENS"), Ok(None)) {
+            return Err(ConfigError::InvalidValue {
+                key: "GATEWAY_USER_TOKENS".to_string(),
+                message: "multi-user gateway authentication is not supported; unset \
+                          GATEWAY_USER_TOKENS and use GATEWAY_AUTH_TOKEN for owner access"
+                    .to_string(),
+            });
+        }
+
         let cs = &settings.channels;
 
         let http_enabled_by_env =
@@ -234,41 +241,6 @@ impl ChannelsConfig {
                 }
             }
 
-            let user_tokens: Option<HashMap<String, UserTokenConfig>> =
-                match optional_env("GATEWAY_USER_TOKENS")? {
-                    Some(json_str) => {
-                        let tokens: HashMap<String, UserTokenConfig> = serde_json::from_str(
-                            &json_str,
-                        )
-                        .map_err(|e| ConfigError::InvalidValue {
-                            key: "GATEWAY_USER_TOKENS".to_string(),
-                            message: format!(
-                                "must be valid JSON object mapping tokens to user configs: {e}"
-                            ),
-                        })?;
-                        if tokens.is_empty() {
-                            return Err(ConfigError::InvalidValue {
-                            key: "GATEWAY_USER_TOKENS".to_string(),
-                            message:
-                                "token map is empty — remove the variable to use single-user mode"
-                                    .to_string(),
-                        });
-                        }
-                        for (tok, cfg) in &tokens {
-                            if cfg.user_id.trim().is_empty() {
-                                return Err(ConfigError::InvalidValue {
-                                    key: "GATEWAY_USER_TOKENS".to_string(),
-                                    message: format!(
-                                        "token '{}...' has an empty user_id",
-                                        &tok[..tok.len().min(8)]
-                                    ),
-                                });
-                            }
-                        }
-                        Some(tokens)
-                    }
-                    None => None,
-                };
             let workspace_read_scopes: Vec<String> = optional_env("WORKSPACE_READ_SCOPES")?
                 .map(|s| {
                     s.split(',')
@@ -300,7 +272,7 @@ impl ChannelsConfig {
                 user_id,
                 workspace_read_scopes,
                 memory_layers,
-                user_tokens,
+                user_tokens: None,
                 ws_ping_interval_secs: parse_optional_env(
                     "WS_PING_INTERVAL_SECS",
                     settings.agent.ws_ping_interval_secs,
