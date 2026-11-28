@@ -878,10 +878,21 @@ still fails gets a copy of its own; nothing prunes these copies, so a name per
 boot would grow without bound. The original stays in place, so the drop repeats only until an operator repairs or deliberately
 moves it. A failed copy warns and does not abort the boot.
 The boot WARN carries the validated mission id, operator path, `error_kind`, the
-quarantine path, and a `missing_field` that names the field only when it is in
-the `MISSION_SCHEMA_FIELDS` allowlist and is `unknown` otherwise;
-unknown variants, invalid values, and full parse errors are confined to DEBUG so
-user-authored goal text cannot leak into ordinary logs (WI#576).
+quarantine path, the document byte count, and the parser's `line`/`column`. The
+document is parsed from its source text (WI#930) because `serde_json::from_value`
+has no source position and reported every data error as `line=0 column=0`; the
+`Value` path remains as a compatibility fallback for duplicate-key documents,
+which `Value` resolves last-wins while a direct struct parse rejects. A
+`missing_field` names the field only when it is in the `MISSION_SCHEMA_FIELDS`
+allowlist and is `unknown` otherwise. A second `field` key locates the top-level
+field behind value-level failures (`unknown variant`, type errors) by
+re-injecting one stored field at a time into a known-good baseline document; it
+is `unknown` when nothing can be located, and every name it can print comes from
+the schema. Unknown variants, invalid values, and full parse errors are confined
+to DEBUG so user-authored goal text cannot leak into ordinary logs (WI#576).
+When at least one record is dropped, one boot-level WARN reports the count
+(`mission_records`) and states that the dropped missions' scheduled work will
+not run until the files are repaired (WI#930).
 
 The daily thread budget (`max_threads_per_day`,
 default 30 via `DEFAULT_MAX_THREADS_PER_DAY` since work item #189, 0 =
