@@ -7,7 +7,7 @@ revision `lunarwing_engine` pins. Copied from `ic/vendor/monty` (the
 `[patch]` of the same git source, the way `patches/wasmtime-internal-cache`
 is used.
 
-Change: exactly one manifest line. The `postcard` dependency keeps
+Change, part 1 — one manifest line. The `postcard` dependency keeps
 `features = ["alloc"]` and adds `default-features = false`:
 
 ```toml
@@ -16,6 +16,14 @@ version = "1.1"
 default-features = false
 features = ["alloc"]
 ```
+
+Change, part 2 — package-layout lines only, no code. The crate archive
+addresses files outside the crate root, which a path dependency does not
+have. `readme = "../../README.md"` becomes `readme = "README.md"`, and
+`src/lib.rs` line 1 becomes `#![doc = include_str!("../README.md")]`; the
+upstream `README.md` and `LICENSE` from the same revision are copied in
+beside the manifest. Those two lines are the only non-manifest edits, and
+`src/` is otherwise byte-identical to the revision.
 
 Why: postcard 1.2.0's default `heapless-cas` feature pulls `heapless 0.7.17`,
 which matches nine unsound advisories (RUSTSEC-2026-0574 through
