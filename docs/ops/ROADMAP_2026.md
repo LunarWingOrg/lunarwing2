@@ -4,9 +4,9 @@
 | Feature | Target |
 |---------|--------|
 | Part 3 of planned overhaul of some LLM engine functionality | v2.2.4.0 |
-| Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.2.4.0 |
 | Lunartica improvements/polish | v2.2.5.0 |
 | Agent Team Coordination improvements | v2.2.5.0 |
+| Polishing of Wayland Desktop Computer Use Capability with upgraded multimodal capable MCP server | v2.2.5.0 |
 | TPM 2.0 Secret Master Key Storage/Decryption Integration via Clevis | v2.2.6.0 |
 | Lunarvision support for multimodal models | v2.2.6.0 |
 | TensorMoon integration as a first-class, self-maintained LunarWing component (packaging/lifecycle, managed config, vendor posture, observability unification) Unified Inference Routing and evaluations | v2.2.6.0 |
