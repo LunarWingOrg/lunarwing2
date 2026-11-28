@@ -26,7 +26,10 @@
 //!   stranded rows: an exact byte-for-byte body missing provenance metadata
 //!   gets its metadata restored, and an empty placeholder row (created just
 //!   before a crash) gets filled in. Operator content never matches either
-//!   shape byte-for-byte, so it is left untouched.
+//!   shape byte-for-byte, so it is left untouched. A primary-scope lookup
+//!   that fails for any reason other than `DocumentNotFound` is reported as
+//!   a per-note failure, never treated as a missing row, so a storage fault
+//!   cannot overwrite an existing note.
 //! - **Wire namespace stays reserved.** Checkout directories under the
 //!   coordination wire prefix (`coord-*`) are never imported, so seeded
 //!   notes cannot collide with wire-ingested notes.
@@ -42,10 +45,11 @@ use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::WorkspaceError;
 use crate::workspace::{
     KnowledgeNoteMeta, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES, MAX_SLUG_BYTES,
     MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES,
-    WIRE_AGENT_PREFIX, Workspace, is_valid_slug, note_path, render_note_markdown,
+    MemoryDocument, WIRE_AGENT_PREFIX, Workspace, is_valid_slug, note_path, render_note_markdown,
 };
 
 /// Directory inside the lw2studymcp checkout holding source Markdown notes.
@@ -143,6 +147,7 @@ struct NoteFile {
 }
 
 /// Result of importing a single note.
+#[derive(Debug)]
 enum SeedOutcome {
     Seeded(usize),
     AlreadyExists,
@@ -255,6 +260,13 @@ pub async fn run_additive_knowledge_import(
     report
 }
 
+/// One checkout note parsed and validated, ready to reconcile with the store.
+struct ParsedNote {
+    meta: KnowledgeNoteMeta,
+    markdown: String,
+    source_bytes: usize,
+}
+
 /// Import one checkout note into the private knowledge store.
 async fn seed_note(
     workspace: &Workspace,
@@ -262,12 +274,26 @@ async fn seed_note(
     allow_new_note: bool,
     remaining_bytes: usize,
 ) -> Result<SeedOutcome, String> {
-    let path = note_path(&note.agent, &note.topic);
-    let existing = workspace.read_primary(&path).await.ok();
     let raw =
         std::fs::read_to_string(&note.path).map_err(|error| format!("read failed: {error}"))?;
+    let parsed = parse_note(note, &raw)?;
+    let path = note_path(&note.agent, &note.topic);
+    let lookup = workspace.read_primary(&path).await;
+    apply_parsed_note(
+        workspace,
+        &path,
+        &parsed,
+        lookup,
+        allow_new_note,
+        remaining_bytes,
+    )
+    .await
+}
+
+/// Parse and validate one checkout note's title, body, and metadata.
+fn parse_note(note: &NoteFile, raw: &str) -> Result<ParsedNote, String> {
     let source_bytes = raw.len();
-    let (metadata_json, markdown) = split_note(&raw)?;
+    let (metadata_json, markdown) = split_note(raw)?;
     let (title, body) = extract_title(markdown, &note.topic);
     if title.len() > MAX_TITLE_BYTES {
         return Err(format!("title exceeds {MAX_TITLE_BYTES} UTF-8 bytes"));
@@ -279,41 +305,66 @@ async fn seed_note(
         return Err(format!("body exceeds {MAX_CONTENT_BYTES} UTF-8 bytes"));
     }
     let meta = build_meta(&note.agent, &note.topic, &title, metadata_json.as_ref())?;
-    let markdown = render_note_markdown(&title, &body);
+    Ok(ParsedNote {
+        meta,
+        markdown: render_note_markdown(&title, &body),
+        source_bytes,
+    })
+}
 
+/// Reconcile one parsed note with its primary-scope row.
+///
+/// `lookup` is the result of the primary-scope read. Only a confirmed
+/// `DocumentNotFound` may take the missing-row branch: any other lookup
+/// error is reported as a per-note failure so a storage fault can never be
+/// mistaken for an absent note and overwrite existing content.
+async fn apply_parsed_note(
+    workspace: &Workspace,
+    path: &str,
+    parsed: &ParsedNote,
+    lookup: Result<MemoryDocument, WorkspaceError>,
+    allow_new_note: bool,
+    remaining_bytes: usize,
+) -> Result<SeedOutcome, String> {
+    let existing = match lookup {
+        Ok(document) => Some(document),
+        Err(WorkspaceError::DocumentNotFound { .. }) => None,
+        Err(error) => return Err(format!("lookup failed: {error}")),
+    };
+    let meta_json = parsed.meta.to_metadata_json();
     if let Some(existing) = existing {
         if KnowledgeNoteMeta::from_metadata_json(&existing.metadata).is_some() {
             return Ok(SeedOutcome::AlreadyExists);
         }
-        if existing.content == markdown {
+        if existing.content == parsed.markdown {
             workspace
-                .set_document_metadata(&path, &meta.to_metadata_json())
+                .set_document_metadata(path, &meta_json)
                 .await
                 .map_err(|error| format!("metadata repair failed: {error}"))?;
         } else if existing.content.trim().is_empty() {
             workspace
-                .write(&path, &markdown)
+                .write(path, &parsed.markdown)
                 .await
                 .map_err(|error| format!("stranded-row write failed: {error}"))?;
             workspace
-                .set_document_metadata(&path, &meta.to_metadata_json())
+                .set_document_metadata(path, &meta_json)
                 .await
                 .map_err(|error| format!("metadata repair failed: {error}"))?;
         }
         return Ok(SeedOutcome::AlreadyExists);
     }
-    if !allow_new_note || source_bytes > remaining_bytes {
+    if !allow_new_note || parsed.source_bytes > remaining_bytes {
         return Ok(SeedOutcome::Deferred);
     }
     workspace
-        .write(&path, &markdown)
+        .write(path, &parsed.markdown)
         .await
         .map_err(|error| format!("write failed: {error}"))?;
     workspace
-        .set_document_metadata(&path, &meta.to_metadata_json())
+        .set_document_metadata(path, &meta_json)
         .await
         .map_err(|error| format!("metadata write failed: {error}"))?;
-    Ok(SeedOutcome::Seeded(source_bytes))
+    Ok(SeedOutcome::Seeded(parsed.source_bytes))
 }
 
 /// Enumerate importable note files, sorted for a deterministic pass order.
@@ -1107,6 +1158,96 @@ mod tests {
                 .await
                 .expect("local note");
             assert!(local.content.contains("operator edit"));
+        }
+
+        /// A lookup that fails for a reason other than `DocumentNotFound` is
+        /// a storage fault, not a missing note. Acting on it as "absent"
+        /// would write checkout content over an operator's customized row,
+        /// so the fault must abort the note without touching the store.
+        #[tokio::test]
+        async fn lookup_failure_never_overwrites_an_existing_note() {
+            let (db, _db_dir) = crate::testing::test_db().await;
+            let workspace = Workspace::new_with_db("alice", db);
+            let fixture = tempfile::tempdir().expect("fixture");
+            let notes_dir = fixture.path().join(NOTES_DIR);
+            write_note(
+                &notes_dir,
+                "rarity",
+                "customized.md",
+                "# Checkout title\n\ncheckout body\n",
+            );
+            write_note(&notes_dir, "rarity", "brand-new.md", "# New\n\nnew body\n");
+
+            // Operator-customized row: body differs from the checkout and it
+            // carries no knowledge provenance, so a missing-row branch would
+            // overwrite it rather than short-circuiting as AlreadyExists.
+            let customized = note_path("rarity", "customized");
+            workspace
+                .write(&customized, "# Customized\n\noperator edits\n")
+                .await
+                .expect("operator write");
+
+            let note = NoteFile {
+                agent: "rarity".to_string(),
+                topic: "customized".to_string(),
+                path: notes_dir.join("rarity/customized.md"),
+            };
+            let raw = std::fs::read_to_string(&note.path).expect("note file");
+            let parsed = parse_note(&note, &raw).expect("parsed");
+
+            // The store itself is healthy here: the write lane would accept
+            // the content. Only the injected lookup fails, exactly as a pool
+            // exhaustion or query error does.
+            let error = apply_parsed_note(
+                &workspace,
+                &customized,
+                &parsed,
+                Err(WorkspaceError::SearchFailed {
+                    reason: "pool exhausted".to_string(),
+                }),
+                true,
+                usize::MAX,
+            )
+            .await
+            .expect_err("storage error must be reported");
+            assert!(error.contains("lookup failed"), "{error}");
+
+            let doc = workspace
+                .read_primary(&customized)
+                .await
+                .expect("customized doc");
+            assert!(doc.content.contains("operator edits"));
+            assert!(!doc.content.contains("checkout body"));
+            assert!(KnowledgeNoteMeta::from_metadata_json(&doc.metadata).is_none());
+
+            // A confirmed miss (the real backend's DocumentNotFound) still
+            // imports the note.
+            let missing = note_path("rarity", "brand-new");
+            let lookup = workspace.read_primary(&missing).await;
+            assert!(matches!(
+                lookup,
+                Err(WorkspaceError::DocumentNotFound { .. })
+            ));
+            let brand_new = NoteFile {
+                agent: "rarity".to_string(),
+                topic: "brand-new".to_string(),
+                path: notes_dir.join("rarity/brand-new.md"),
+            };
+            let raw = std::fs::read_to_string(&brand_new.path).expect("note file");
+            let parsed = parse_note(&brand_new, &raw).expect("parsed");
+            let outcome =
+                apply_parsed_note(&workspace, &missing, &parsed, lookup, true, usize::MAX)
+                    .await
+                    .expect("missing note imports");
+            assert!(matches!(outcome, SeedOutcome::Seeded(_)));
+
+            let imported = workspace
+                .read_primary(&missing)
+                .await
+                .expect("imported note");
+            assert!(imported.content.contains("new body"));
+            let meta = KnowledgeNoteMeta::from_metadata_json(&imported.metadata).expect("meta");
+            assert_eq!(meta.topic, "brand-new");
         }
 
         #[tokio::test]
