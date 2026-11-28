@@ -5854,11 +5854,17 @@ mod tests {
             (json!({"message": "explicit", "priority": "5"}), 5),
         ] {
             let params = prepare_tool_params(&tool, &input);
+            if input.get("priority").is_none() {
+                assert!(
+                    params.get("priority").is_none(),
+                    "the guest supplies the default"
+                );
+            }
             let output = tool
                 .execute(params, &ctx)
                 .await
                 .expect("send Gotify notification");
-            assert_eq!(output.result["success"], true);
+            assert_eq!(output.result["success"].as_bool(), Some(true));
             let body = received.try_recv().expect("receiver got a POST /message");
             assert_eq!(body["message"], input["message"]);
             assert_eq!(body["priority"], expected);
