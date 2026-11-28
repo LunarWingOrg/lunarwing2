@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use wasmtime::Store;
@@ -146,6 +146,12 @@ fn matches_bridge_origin(raw_url: &str, allowed_origins: &[String]) -> bool {
     })
 }
 
+fn is_long_poll_wait_endpoint(raw_url: &str) -> bool {
+    url::Url::parse(raw_url)
+        .ok()
+        .is_some_and(|url| url.path() == "/api/wait")
+}
+
 /// Store data for WASM channel execution.
 ///
 /// Contains the resource limiter, channel-specific host state, and WASI context.
@@ -174,6 +180,8 @@ struct ChannelStoreData {
     /// (placeholder or host credential); scopes the identity-encoding
     /// request and the opaque-body refusal (HJ-1/HQ-2 parity).
     last_http_exchange_had_credentials: bool,
+    /// Whether this callback received HTTP 401 from the long-poll endpoint.
+    wait_auth_rejected: bool,
 }
 
 impl ChannelStoreData {
@@ -200,6 +208,7 @@ impl ChannelStoreData {
             allow_private_ips: private_http_targets_allowed(),
             allowed_bridge_origins: Arc::new(std::sync::RwLock::new(Vec::new())),
             last_http_exchange_had_credentials: false,
+            wait_auth_rejected: false,
         }
     }
 
@@ -706,7 +715,11 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
         // values in deny reasons; response headers can echo the form-encoded
         // query-param credential via a redirect `Location`; response bodies
         // echo the redirect target URL on common 3xx edges.
+        let is_wait_endpoint = is_long_poll_wait_endpoint(&url);
         let outcome = self.http_request_inner(method, url, headers_json, body, timeout_ms);
+        if is_wait_endpoint && matches!(&outcome, Ok(response) if response.status == 401) {
+            self.wait_auth_rejected = true;
+        }
         let outcome = self.redact_http_outcome_for_guest(outcome);
 
         match &outcome {
@@ -860,6 +873,7 @@ enum WasmChannelHealthState {
     StartupDegraded,
     PollFailed,
     PollDispatchFailed,
+    PollAuthFailed,
 }
 
 const CALLBACK_HEALTH_PREFIX: &str = "[health]";
@@ -873,6 +887,7 @@ impl WasmChannelHealthState {
             value if value == Self::StartupDegraded as u8 => Self::StartupDegraded,
             value if value == Self::PollFailed as u8 => Self::PollFailed,
             value if value == Self::PollDispatchFailed as u8 => Self::PollDispatchFailed,
+            value if value == Self::PollAuthFailed as u8 => Self::PollAuthFailed,
             _ => Self::StartupFailed,
         }
     }
@@ -884,6 +899,7 @@ impl WasmChannelHealthState {
             Self::StartupDegraded => Some("startup callback reported a warning or error"),
             Self::PollFailed => Some("polling callback persistently failing"),
             Self::PollDispatchFailed => Some("polling callback output could not be delivered"),
+            Self::PollAuthFailed => Some("polling authentication rejected; credentials need refresh"),
         }
     }
 }
@@ -946,6 +962,9 @@ pub struct WasmChannel {
     /// below the threshold do not flap externally reported health.
     consecutive_poll_failures: Arc<std::sync::atomic::AtomicU32>,
 
+    /// Suppresses repeated authentication failure logs until polling recovers.
+    auth_failure_logged: Arc<std::sync::atomic::AtomicBool>,
+
     /// Registered HTTP endpoints.
     endpoints: RwLock<Vec<RegisteredEndpoint>>,
 
@@ -953,6 +972,9 @@ pub struct WasmChannel {
     /// Keys are placeholder names like "XMPP_PASSWORD".
     /// Wrapped in Arc for sharing with the polling task.
     credentials: Arc<RwLock<HashMap<String, String>>>,
+
+    /// Signals polling tasks to retry after credentials are refreshed.
+    credential_updates: watch::Sender<u64>,
 
     /// Background task that repeats typing indicators every 4 seconds.
     /// Transient typing indicators can expire quickly, so we refresh them.
@@ -1172,6 +1194,7 @@ impl WasmChannel {
         let allowed_bridge_origins = Arc::new(std::sync::RwLock::new(configured_bridge_origins(
             &config_json,
         )));
+        let (credential_updates, _) = watch::channel(0);
 
         Self {
             name,
@@ -1193,8 +1216,10 @@ impl WasmChannel {
                 WasmChannelHealthState::Healthy as u8,
             )),
             consecutive_poll_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            auth_failure_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
+            credential_updates,
             typing_task: RwLock::new(None),
             pairing_store,
             workspace_store: Arc::new(ChannelWorkspaceStore::new()),
@@ -1292,12 +1317,14 @@ impl WasmChannel {
         );
     }
 
-    /// Set a credential for URL injection.
+    /// Set a credential for URL injection and wake authentication-paused polling.
     pub async fn set_credential(&self, name: &str, value: String) {
         self.credentials
             .write()
             .await
             .insert(name.to_string(), value);
+        self.credential_updates
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// Get a snapshot of credentials for use in callbacks.
