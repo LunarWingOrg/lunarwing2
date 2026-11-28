@@ -1,10 +1,13 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { once } from "node:events"
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createInterface } from "node:readline"
 import { fileURLToPath } from "node:url"
 import { test } from "node:test"
+import { runInNewContext } from "node:vm"
 
 /**
  * Real-CLI flag contract tests (WI#195 finding 2).
@@ -44,11 +47,9 @@ import { test } from "node:test"
  * provider was contacted — everything the contract needs, in a few seconds
  * instead of the full ~60s+ retry exhaustion.
  *
- * Self-skip: when no real kimi binary is on PATH (host dev machines) all
- * four tests skip. In the worker image build (`npm test` in the Dockerfile) the
- * gate asserts the contract for real — `bin/kimi` is on PATH there; if the
- * build layout ever changes, KIMI_BIN can point at the installed CLI
- * explicitly.
+ * The four upstream contract tests skip when no Kimi binary is available on
+ * a developer host. The offline image gate sets KIMI_BIN and
+ * KIMI_WORKER_TEST_BUNDLE explicitly and requires the installed CLI.
  */
 
 interface ParsedResult {
@@ -134,7 +135,9 @@ async function probeRealKimi(): Promise<string | undefined> {
   return undefined
 }
 
+const workerBundle = process.env.KIMI_WORKER_TEST_BUNDLE
 const realKimi = await probeRealKimi()
+if (workerBundle && !realKimi) throw new Error("The offline worker gate requires a runnable Kimi CLI")
 const contractOpts: { skip: boolean; timeout: number } = { skip: realKimi === undefined, timeout: 60_000 }
 const realKimiBin = realKimi ?? "kimi"
 
@@ -439,5 +442,100 @@ process.stdin.on("data", (chunk) => {
     }
   },
 )
+
+test("worker feedback patch rejects unreviewed versions and bundle drift", async () => {
+  const prefix = mkdtempSync(join(tmpdir(), "kimi-feedback-drift-"))
+  const dist = join(prefix, "node_modules/@moonshot-ai/kimi-code/dist")
+  const patcher = fileURLToPath(new URL("./disable_kimi_feedback.js", import.meta.url))
+  try {
+    mkdirSync(dist, { recursive: true })
+    const bundle = join(dist, "main.mjs")
+    writeFileSync(bundle, "// unexpected bundle\n")
+    for (const [version, reason] of [
+      ["0.0.0", /no reviewed feedback patch/],
+      ["2.7.2", /differs from the reviewed feedback source/],
+    ] as const) {
+      const result = await runCli(process.execPath, [patcher, version, prefix], {})
+      assert.notEqual(result.code, 0)
+      assert.match(result.stderr, reason)
+      assert.equal(readFileSync(bundle, "utf8"), "// unexpected bundle\n")
+    }
+  } finally {
+    rmSync(prefix, { recursive: true, force: true })
+  }
+})
+
+if (workerBundle) {
+  test("real CLI worker bundle refuses TUI feedback before resolving a target", async () => {
+    const source = readFileSync(workerBundle, "utf8")
+    assert.equal(statSync(workerBundle).mode & 0o222, 0)
+    assert.ok(!source.includes('getEnv("KIMI_CODE_FEEDBACK_BASE_URL")'))
+    // Test the class from the installed bundle without opening an interactive TUI.
+    // None of its dependencies, including fetch and credential lookup, are supplied.
+    const start = source.indexOf("FeedbackService = class FeedbackService {")
+    const end = source.indexOf(";\n\tFeedbackService = __decorate([", start)
+    assert.ok(start >= 0 && end > start, "review the worker's TUI feedback assertion")
+    const Feedback = runInNewContext(`(${source.slice(start + "FeedbackService = ".length, end)})`) as
+      new () => { availability: () => Promise<unknown>; submit: (input: object) => Promise<unknown> }
+    const service = new Feedback()
+    for (const result of [await service.availability(), await service.submit({ attachmentLevel: "logs+codebase" })]) {
+      assert.match(JSON.stringify(result), /"kind":"error".*Feedback is disabled in LunarWing workers/)
+    }
+  })
+
+  test("real CLI worker bundle does not register KAP feedback routes even with the URL override", {
+    timeout: 30_000,
+  }, async () => {
+    const home = mkdtempSync(join(tmpdir(), "kimi-feedback-kap-"))
+    const proc = spawn(process.execPath, [workerBundle, "web", "--host", "127.0.0.1", "--port", "0", "--json"], {
+      cwd: home,
+      env: {
+        PATH: process.env.PATH,
+        HOME: home,
+        KIMI_CODE_HOME: join(home, ".kimi-code"),
+        KIMI_CODE_NO_AUTO_UPDATE: "1",
+        KIMI_DISABLE_TELEMETRY: "1",
+        KIMI_CODE_FEEDBACK_BASE_URL: "http://127.0.0.1:1/not-used",
+      },
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+    const closed = once(proc, "close")
+    const lines = createInterface({ input: proc.stdout })
+    const signal = AbortSignal.timeout(20_000)
+    try {
+      const [line] = await Promise.race([
+        once(lines, "line", { signal }),
+        closed.then(([code]) => { throw new Error(`Kimi web exited before startup (code ${code})`) }),
+      ])
+      const { origin, token } = JSON.parse(line) as { origin: string; token: string }
+      assert.match(origin, /^http:\/\/127\.0\.0\.1:\d+$/)
+      assert.ok(typeof token === "string" && token.length > 0)
+      const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+      const meta = await fetch(`${origin}/api/v1/meta`, { headers, signal, redirect: "error" })
+      assert.equal(meta.status, 200)
+      const { data } = await meta.json() as { data: { capabilities: Record<string, unknown> } }
+      assert.equal(data.capabilities.websocket, true)
+      assert.ok(!Object.hasOwn(data.capabilities, "feedback"))
+      for (const [method, route] of [
+        ["POST", "/feedback"],
+        ["PATCH", "/feedback/1"],
+        ["POST", "/feedback/1/attachments"],
+        ["POST", "/feedback/1/attachments/session"],
+        ["POST", "/feedback/session-archives"],
+      ]) {
+        const response = await fetch(`${origin}/api/v1${route}`, {
+          method, headers, body: "{}", signal, redirect: "error",
+        })
+        assert.equal(response.status, 404, `${method} ${route} must not be registered`)
+        await response.body?.cancel()
+      }
+    } finally {
+      lines.close()
+      proc.kill("SIGKILL")
+      await closed.catch(() => {})
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+}
 
 console.log(realKimi ? `kimi CLI contract self-check passed (real binary: ${realKimi})` : "kimi CLI contract self-check skipped (no real kimi binary)")
