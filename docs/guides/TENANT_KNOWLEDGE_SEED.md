@@ -258,8 +258,11 @@ After provisioning and the first `start-tenant`:
 
    Complete older markers without `schema_version` still prevent a rerun.
    `notes_failed` counts import failures, such as unreadable source files,
-   empty bodies, or workspace write errors. While the marker is valid,
-   bootstrap does not retry those notes on each boot.
+   empty bodies, or workspace write errors. A note whose primary-scope lookup
+   fails with a storage error is counted too and left untouched: only a
+   confirmed "no such document" result may take the new-note or repair path,
+   so a database fault can never replace an existing note. While the marker is
+   valid, bootstrap does not retry those notes on each boot.
 
 4. **Store populated:** the tenant's PostgreSQL contains
    `study-notes/<agent>/<topic>.md` documents (verification run: 1,249

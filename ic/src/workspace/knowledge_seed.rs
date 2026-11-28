@@ -26,7 +26,10 @@
 //!   stranded rows: an exact byte-for-byte body missing provenance metadata
 //!   gets its metadata restored, and an empty placeholder row (created just
 //!   before a crash) gets filled in. Operator content never matches either
-//!   shape byte-for-byte, so it is left untouched.
+//!   shape byte-for-byte, so it is left untouched. A primary-scope lookup
+//!   that fails for any reason other than `DocumentNotFound` is reported as
+//!   a per-note failure, never treated as a missing row, so a storage fault
+//!   cannot overwrite an existing note.
 //! - **Wire namespace stays reserved.** Checkout directories under the
 //!   coordination wire prefix (`coord-*`) are never imported, so seeded
 //!   notes cannot collide with wire-ingested notes.
@@ -1232,9 +1235,10 @@ mod tests {
             };
             let raw = std::fs::read_to_string(&brand_new.path).expect("note file");
             let parsed = parse_note(&brand_new, &raw).expect("parsed");
-            let outcome = apply_parsed_note(&workspace, &missing, &parsed, lookup, true, usize::MAX)
-                .await
-                .expect("missing note imports");
+            let outcome =
+                apply_parsed_note(&workspace, &missing, &parsed, lookup, true, usize::MAX)
+                    .await
+                    .expect("missing note imports");
             assert!(matches!(outcome, SeedOutcome::Seeded(_)));
 
             let imported = workspace
