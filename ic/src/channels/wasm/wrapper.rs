@@ -6782,6 +6782,93 @@ mod tests {
         assert!(msg.attachments.is_empty()); // safety: test-only assertion
     }
 
+    #[tokio::test]
+    async fn http_401_signal_is_limited_to_weechat_wait_requests() {
+        use crate::channels::wasm::wrapper::lunarwing::agent::channel_host::Host as _;
+
+        let app = Router::new()
+            .route("/api/wait", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route("/api/health", get(|| async { StatusCode::UNAUTHORIZED }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind auth response test server");
+        let address = listener.local_addr().expect("Missing test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Auth response test server failed");
+        });
+        let base_url = format!("http://{address}");
+        let capabilities = ChannelCapabilitiesFile::from_bytes(
+            &std::fs::read(weechat_source_dir().join("weechat.capabilities.json"))
+                .expect("Failed to read WeeChat capabilities"),
+        )
+        .expect("Failed to parse WeeChat capabilities")
+        .to_capabilities();
+        let bridge_origins = Arc::new(std::sync::RwLock::new(vec![base_url.clone()]));
+        let (wait_status, wait_auth_failed, other_auth_failed, health_auth_failed) =
+            tokio::task::spawn_blocking(move || {
+                let make_store = |channel_name: &str| {
+                    ChannelStoreData::new(
+                        1024 * 1024,
+                        channel_name,
+                        capabilities.clone(),
+                        HashMap::new(),
+                        Vec::new(),
+                        Arc::new(PairingStore::new()),
+                    )
+                    .with_bridge_origins(Arc::clone(&bridge_origins))
+                };
+
+                let mut wait_store = make_store("weechat");
+                let wait_response = wait_store
+                    .http_request(
+                        "GET".to_string(),
+                        format!("{base_url}/api/wait"),
+                        "{}".to_string(),
+                        None,
+                        Some(1_000),
+                    )
+                    .expect("Mock wait request should return HTTP 401");
+
+                let mut other_channel_store = make_store("xmpp");
+                other_channel_store
+                    .http_request(
+                        "GET".to_string(),
+                        format!("{base_url}/api/wait"),
+                        "{}".to_string(),
+                        None,
+                        Some(1_000),
+                    )
+                    .expect("Other channel request should return HTTP 401");
+
+                let mut health_store = make_store("weechat");
+                health_store
+                    .http_request(
+                        "GET".to_string(),
+                        format!("{base_url}/api/health"),
+                        "{}".to_string(),
+                        None,
+                        Some(1_000),
+                    )
+                    .expect("Mock health request should return HTTP 401");
+
+                (
+                    wait_response.status,
+                    wait_store.wait_auth_rejected,
+                    other_channel_store.wait_auth_rejected,
+                    health_store.wait_auth_rejected,
+                )
+            })
+            .await
+            .expect("HTTP auth signal checks should complete");
+        assert_eq!(wait_status, 401);
+        assert!(wait_auth_failed);
+        assert!(!other_auth_failed);
+        assert!(!health_auth_failed);
+        server.abort();
+    }
+
     #[test]
     fn weechat_wait_auth_detection_is_scoped_to_get_endpoint() {
         assert!(is_weechat_wait_endpoint(
