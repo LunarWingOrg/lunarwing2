@@ -195,6 +195,8 @@ FULL_VALIDATION_JOBS = (
     "rust-check-libsql",
     "rust-check-all-features",
     "rust-test-libsql",
+    "rust-test-libsql-integration",
+    "rust-test-wasm-channels",
     "rust-test-postgres-integration",
     "cavepony-wasm",
     "architecture-boundaries",

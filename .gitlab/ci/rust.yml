@@ -92,11 +92,29 @@ wasm-channel-test-artifacts:
     - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path channels-src/xmpp/Cargo.toml
     - cp ic/channels-src/xmpp/target/wasm32-wasip2/release/xmpp_channel.wasm ic/channels-src/xmpp/xmpp.wasm
     - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path ../lunarwing_weechat_wss/weechat_relay/Cargo.toml
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path ../darkirc_channel_for_lunarwing/darkirc/Cargo.toml
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path tests/fixtures/test-echo-tool/Cargo.toml
   artifacts:
     expire_in: 1 day
     paths:
       - ic/channels-src/xmpp/xmpp.wasm
       - lunarwing_weechat_wss/weechat_relay/target/wasm32-wasip2/release/weechat_relay_channel.wasm
+      - darkirc_channel_for_lunarwing/darkirc/target/wasm32-wasip2/release/darkirc_channel.wasm
+      - ic/tests/fixtures/test-echo-tool/target/wasm32-wasip2/release/test_echo_tool.wasm
+
+rust-test-wasm-channels:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: test
+  needs: []
+  variables:
+    CARGO_TARGET_DIR: "$CI_PROJECT_DIR/.ci-cache/wasm-channel-test-target"
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --lib --manifest-path ../darkirc_channel_for_lunarwing/darkirc/Cargo.toml -- --test-threads=1
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --lib --manifest-path ../lunarwing_weechat_wss/weechat_relay/Cargo.toml -- --test-threads=1
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --lib --manifest-path channels-src/xmpp/Cargo.toml -- --test-threads=1
+    - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --lib --manifest-path channels-src/multica/Cargo.toml -- --test-threads=1
 
 # Owner: core maintainers. Block after MSRV (1.96.1) is confirmed green and the
 # plan §15.5 reconciliation is closed. Removing this job reopens the
@@ -188,6 +206,38 @@ rust-test-libsql:
   script:
     # libSQL's full test link approaches the 16 GB runner limit; serialize rustc and omit debug info.
     - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
+
+rust-test-libsql-integration:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: test
+  needs:
+    - job: rust-check-libsql
+      artifacts: false
+    - job: wasm-channel-test-artifacts
+      artifacts: true
+  variables:
+    LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
+    LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
+    CARGO_PROFILE_TEST_DEBUG: "0"
+  script:
+    # Separate from the regular libSQL suite to bound per-job disk and runtime.
+    - >-
+      bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features
+      --features libsql,integration,html-to-markdown --no-fail-fast
+      --test e2e_thread_scheduling
+      --test engine_v2_eager_init
+      --test engine_v2_interrupt_ingress
+      --test engine_v2_channel_delivery
+      --test engine_v2_irc_wasm
+      --test engine_v2_wasm_tool
+      --test engine_v2_mcp_compatibility
+      --test engine_v2_skill_selection
+      --test engine_v2_tool_info_missions
+      --test engine_v2_tensorzero_streaming
+      --test html_to_markdown
+      -- --test-threads=1
 
 rust-test-postgres-integration:
   extends:

@@ -154,7 +154,7 @@ The agent calls the `gotify` tool with a JSON payload:
 |---|---|---|---|---|
 | `message` | string | yes (schema) | `Notification from LunarWing` (guest fallback) | Notification body (supports markdown) |
 | `title` | string | no | From `config/gotify.json`, or `LunarWing` | Notification title |
-| `priority` | integer | no | `9` in the guest | Specify it explicitly: the published tool schema still advertises `3`. |
+| `priority` | integer | no | `9` | Notification priority (1–3 low, 5–7 medium, 8–10 high) |
 
 For routine prompts that use Gotify, see `ic/docs/GOTIFY_ROUTINE_PROMPT.md`.
 

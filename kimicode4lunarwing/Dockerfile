@@ -62,21 +62,22 @@ RUN set -eu; \
     npm test; \
     rm -rf node_modules/.cache
 
-# ── CLI bitness + flag contract gate ─────────────────────────────────────────
-# WI#195 finding 2: every worker test points KIMI_BIN at a mock, so the real
-# CLI's flag surface was pinned only in a comment. Compile the CLI (locked
-# version — kimi-cli/package-lock.json is the reproducible pin) for the
-# image's node, then re-run just the contract tests with the real binary on
-# PATH. The lane self-skips on host builds (no binary), so this is the only
-# place the contract is asserted for real.
+# ── Locked CLI and offline contract gate ─────────────────────────────────────
+# The general worker suite uses CLI shims. Install the locked CLI, apply the
+# worker feedback patch, and pass the installed binary to the real-CLI suite.
+# Only this gate requires a runnable CLI; the general host suite can self-skip
+# the upstream invocations if the CLI is absent. The feedback route probe
+# binds only on loopback, with external networking disabled for the test.
 ARG KIMI_CODE_VERSION
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
 RUN set -eu; \
     . /build/worker-download-retry.sh; \
     wdr_retry "npm ci (kimi CLI)" "rm -rf /opt/kimi-cli/node_modules" \
       'npm ci --omit=dev --prefix /opt/kimi-cli'; \
-    PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
-      --test-name-pattern "real CLI"
+    node /build/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli
+RUN --network=none KIMI_WORKER_TEST_BUNDLE=/opt/kimi-cli/node_modules/@moonshot-ai/kimi-code/dist/main.mjs \
+    KIMI_BIN=/opt/kimi-cli/node_modules/.bin/kimi \
+    node --test --test-timeout=120000 /build/scripts/kimi_cli_contract_test.js
 
 # ──────────────────────────────
 # Stage 2: runtime image
@@ -266,6 +267,7 @@ RUN --mount=type=bind,from=builder,source=/build/worker-download-retry.sh,target
     wdr_retry "npm install -g npm@12.0.2" "-" 'npm install -g npm@12.0.2' && \
     wdr_retry "npm ci (kimi CLI runtime)" "rm -rf /opt/kimi-cli/node_modules" \
       'npm ci --omit=dev --prefix /opt/kimi-cli' && \
+    node /app/scripts/disable_kimi_feedback.js "$KIMI_CODE_VERSION" /opt/kimi-cli && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
     npm cache clean --force && \
