@@ -16,6 +16,7 @@ use exports::lunarwing::agent::tool;
 // ── Types ───────────────────────────────────────────────────────
 
 const DEFAULT_TITLE: &str = "LunarWing";
+const DEFAULT_PRIORITY: i32 = 9;
 
 #[derive(Deserialize)]
 struct SendInput {
@@ -31,7 +32,7 @@ fn default_message() -> String {
 }
 
 fn default_priority() -> i32 {
-    9
+    DEFAULT_PRIORITY
 }
 
 #[derive(Serialize)]
@@ -63,30 +64,32 @@ impl tool::Guest for GotifyTool {
     }
 
     fn schema() -> String {
-        r#"{
-  "type": "object",
-  "properties": {
-    "title": {
-      "type": "string",
-      "description": "Notification title. Defaults to value from config/gotify.json, or 'LunarWing'."
-    },
-    "message": {
-      "type": "string",
-      "description": "Notification body text. Supports markdown."
-    },
-    "priority": {
-      "type": "integer",
-      "description": "Priority: 1-3=low, 5-7=medium, 8-10=high. Default 9.",
-      "default": 9
-    }
-  },
-  "required": ["message"]
-}"#
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Notification title. Defaults to value from config/gotify.json, or 'LunarWing'."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Notification body text. Supports markdown."
+                },
+                "priority": {
+                    "type": "integer",
+                    "description": format!("Priority: 1-3=low, 5-7=medium, 8-10=high. Default {DEFAULT_PRIORITY}."),
+                    "default": DEFAULT_PRIORITY
+                }
+            },
+            "required": ["message"]
+        })
         .to_string()
     }
 
     fn description() -> String {
-        "Send a push notification via Gotify. Parameters (JSON object): message (string, REQUIRED), title (string, default: configurable via config/gotify.json or 'LunarWing'), priority (integer: 1-3=low, 5-7=medium, 8-10=high, default: 9). Example: {\"message\": \"hello\", \"priority\": 5}".to_string()
+        format!(
+            r#"Send a push notification via Gotify. Parameters (JSON object): message (string, REQUIRED), title (string, default: configurable via config/gotify.json or 'LunarWing'), priority (integer: 1-3=low, 5-7=medium, 8-10=high, default: {DEFAULT_PRIORITY}). Example: {{"message": "hello", "priority": 5}}"#
+        )
     }
 }
 
@@ -197,5 +200,29 @@ fn dispatch(params_json: &str) -> Result<String, String> {
         ))
     } else {
         Err(format!("Gotify returned HTTP {status}: {resp_body}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::{tool::Guest, GotifyTool, SendInput};
+
+    #[test]
+    fn priority_default_matches_discovery_schemas() {
+        let input: SendInput = serde_json::from_str(r#"{"message":"hello"}"#).expect("parse input");
+        assert_eq!(input.priority, 9);
+
+        let guest: Value = serde_json::from_str(&GotifyTool::schema()).expect("parse guest schema");
+        let packaged: Value = serde_json::from_str(include_str!("../gotify.capabilities.json"))
+            .expect("parse packaged schema");
+        let schema_path = "/properties/priority/default";
+        let expected = json!(input.priority);
+        assert_eq!(guest.pointer(schema_path), Some(&expected));
+        assert_eq!(
+            packaged["tools"][0]["parameters"].pointer(schema_path),
+            Some(&expected)
+        );
     }
 }
