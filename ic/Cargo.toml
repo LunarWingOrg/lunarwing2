@@ -11,6 +11,11 @@ exclude = [
 [patch.crates-io]
 wasmtime-internal-cache = { path = "patches/wasmtime-internal-cache" }
 
+# WI#934: Monty with postcard's default features off (see
+# patches/monty/LUNARWING-PATCH.md). Keep the git pin in lunarwing_engine.
+[patch."https://github.com/pydantic/monty.git"]
+monty = { path = "patches/monty" }
+
 [package]
 name = "lunarwing"
 version = "2.2.3"
