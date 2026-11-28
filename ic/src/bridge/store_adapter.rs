@@ -36,7 +36,7 @@ use uuid::Uuid;
 use lunarwing_engine::{
     CapabilityLease, ConversationId, ConversationSurface, DocId, DocType, EngineError, LeaseId,
     MemoryDoc, Project, ProjectId, Step, Store, Thread, ThreadEvent, ThreadId, ThreadState,
-    types::mission::{Mission, MissionId, MissionStatus},
+    types::mission::{Mission, MissionCadence, MissionId, MissionStatus},
     types::shared_owner_id,
 };
 
@@ -204,7 +204,7 @@ impl HybridStore {
         })
         .await;
         // Missions live under each project: engine/projects/{slug}/missions/{slug}/mission.json
-        self.load_missions_from_projects(ws).await?;
+        let missions_unparseable = self.load_missions_from_projects(ws).await?;
 
         // Backfill archived threads referenced by missions but missing from the
         // active threads map (threads archived before the fix that preserves
@@ -228,6 +228,7 @@ impl HybridStore {
             events,
             leases,
             missions,
+            missions_unparseable,
             docs,
             "loaded engine state from workspace"
         );
@@ -1109,10 +1110,10 @@ impl HybridStore {
     /// Preserve an unparseable `mission.json` in the reserved `backups/`
     /// namespace (WI#576, note 17058 point 3).
     ///
-    /// A record that fails `from_value::<Mission>` is dropped from the loaded
-    /// set, but the document itself stays in the workspace and is read again
-    /// at every boot, so the loss repeats with no material an operator can
-    /// inspect. The copy keeps the exact bytes that failed. It lands under
+    /// A record that fails to deserialize as `Mission` is dropped from the
+    /// loaded set, but the document itself stays in the workspace and is read
+    /// again at every boot, so the loss repeats with no material an operator
+    /// can inspect. The copy keeps the exact bytes that failed. It lands under
     /// `backups/` — reserved and chunk-free, same namespace as the
     /// unloadable-default-project snapshot — so the project boot scan
     /// (`engine/projects/*/missions/*`) never revisits it.
@@ -1147,13 +1148,16 @@ impl HybridStore {
 
     /// Load missions from within each project directory.
     ///
-    /// Scans `engine/projects/*/missions/*/mission.json`.
-    async fn load_missions_from_projects(&self, ws: &Workspace) -> Result<(), EngineError> {
+    /// Scans `engine/projects/*/missions/*/mission.json`. Returns the number
+    /// of records dropped for an unparseable document so the caller can
+    /// surface a boot-level alert (WI#930).
+    async fn load_missions_from_projects(&self, ws: &Workspace) -> Result<usize, EngineError> {
         let project_dirs = match ws.list_primary(PROJECTS_PREFIX).await {
             Ok(entries) => entries,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(0),
         };
 
+        let mut unparseable = 0usize;
         let mut candidates = Vec::new();
         for proj_entry in project_dirs {
             if !proj_entry.is_directory {
@@ -1182,7 +1186,7 @@ impl HybridStore {
                     }
                 };
                 match serde_json::from_str::<serde_json::Value>(&doc.content) {
-                    Ok(raw) => match serde_json::from_value::<Mission>(raw.clone()) {
+                    Ok(raw) => match parse_mission_document(&doc.content, &raw) {
                         Ok(mission) => {
                             candidates.push((mission_file, raw, mission));
                         }
@@ -1194,6 +1198,7 @@ impl HybridStore {
                             // project and mission names (OA-8). Validate the
                             // stored id too: corrupt ids can contain arbitrary
                             // text or newlines (OF-1).
+                            unparseable += 1;
                             let mission_id = record_uuid_field(&raw, "id")
                                 .unwrap_or_else(|| "unknown".to_owned());
                             let quarantine = self
@@ -1203,7 +1208,9 @@ impl HybridStore {
                                 path = ?mission_file,
                                 mission_id = %mission_id,
                                 error_kind = %parse_error_kind(&e),
+                                field = mission_parse_field(&raw, &e).unwrap_or("unknown"),
                                 missing_field = mission_missing_field(&e).unwrap_or("unknown"),
+                                content_bytes = doc.content.len(),
                                 quarantine = ?quarantine,
                                 line = e.line(),
                                 column = e.column(),
@@ -1217,6 +1224,7 @@ impl HybridStore {
                         }
                     },
                     Err(e) => {
+                        unparseable += 1;
                         let quarantine = self
                             .quarantine_unparseable_mission(ws, &mission_file, &doc.content)
                             .await;
@@ -1224,6 +1232,7 @@ impl HybridStore {
                             path = ?mission_file,
                             record_id = "unknown",
                             error_kind = %parse_error_kind(&e),
+                            content_bytes = doc.content.len(),
                             quarantine = ?quarantine,
                             line = e.line(),
                             column = e.column(),
@@ -1296,7 +1305,17 @@ impl HybridStore {
             }
             missions.insert(mission.id, mission);
         }
-        Ok(())
+        if unparseable > 0 {
+            // WI#930: a quarantined mission keeps no schedule, so its work
+            // silently stops. One boot-level alert names the loss explicitly
+            // instead of leaving it to per-file warns that scroll away.
+            warn!(
+                mission_records = unparseable,
+                "engine boot: unparseable mission records were dropped; \
+                 their scheduled work will not run until the stored files are repaired"
+            );
+        }
+        Ok(unparseable)
     }
 
     /// Backfill threads referenced by missions but not yet in the in-memory map.
@@ -1659,6 +1678,63 @@ fn mission_missing_field(error: &serde_json::Error) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|candidate| *candidate == field)
+}
+
+/// Parse a stored mission document from its source text (WI#930).
+///
+/// The raw value is parsed first so quarantine and identifier extraction keep
+/// the document, but `from_value` has no source position: every data error it
+/// reports is `line=0 column=0`. Parsing the text carries the real line and
+/// column. `from_value` remains a compatibility fallback because `Value`
+/// resolves duplicate JSON keys last-wins while a direct struct parse rejects
+/// them; such a record loaded before this split and must keep loading.
+fn parse_mission_document(
+    content: &str,
+    raw: &serde_json::Value,
+) -> Result<Mission, serde_json::Error> {
+    serde_json::from_str::<Mission>(content)
+        .or_else(|error| serde_json::from_value::<Mission>(raw.clone()).map_err(|_| error))
+}
+
+/// The top-level mission field the stored document gets wrong (WI#930).
+///
+/// serde names a field only for `missing field`/`unknown field`/`duplicate
+/// field`; `unknown variant` and type errors name the offending *value*
+/// instead, which must not reach `warn!` (WI#321 NY-18). Re-inject one stored
+/// field at a time into a known-good baseline and deserialize: the first
+/// substitution that fails alone is the offender. Every returned name comes
+/// from the schema, never from the document, so it is safe to log.
+fn mission_parse_field(raw: &serde_json::Value, error: &serde_json::Error) -> Option<&'static str> {
+    if let Some(field) = mission_missing_field(error) {
+        return Some(field);
+    }
+    let stored = raw.as_object()?;
+    let baseline = serde_json::to_value(Mission::new(
+        ProjectId::new(),
+        "baseline",
+        "baseline",
+        "baseline",
+        MissionCadence::Manual,
+    ))
+    .ok()?;
+    let baseline = baseline.as_object()?;
+    for (field, placeholder) in baseline {
+        let Some(stored_value) = stored.get(field) else {
+            continue;
+        };
+        if stored_value == placeholder {
+            continue;
+        }
+        let mut probe = baseline.clone();
+        probe.insert(field.clone(), stored_value.clone());
+        if serde_json::from_value::<Mission>(serde_json::Value::Object(probe)).is_err() {
+            return MISSION_SCHEMA_FIELDS
+                .iter()
+                .copied()
+                .find(|known| *known == field.as_str());
+        }
+    }
+    None
 }
 
 /// The user's `"default"` projects in canonical order: oldest first, ties
@@ -2855,6 +2931,93 @@ mod tests {
         assert_eq!(mission_missing_field(&forged), None);
     }
 
+    fn baseline_mission_value() -> serde_json::Value {
+        serde_json::to_value(Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "probe",
+            "keep working",
+            lunarwing_engine::MissionCadence::Manual,
+        ))
+        .expect("mission json")
+    }
+
+    fn parse_failure(raw: &serde_json::Value) -> serde_json::Error {
+        serde_json::from_value::<Mission>(raw.clone()).expect_err("mission must not parse")
+    }
+
+    #[test]
+    fn mission_parse_field_locates_the_failing_schema_field() {
+        // WI#930: `unknown variant` and type errors name the value, never the
+        // field. The probe must identify the top-level field without quoting
+        // anything from the document (NY-18).
+        let mut unknown_variant = baseline_mission_value();
+        unknown_variant["cadence"] = serde_json::json!("not-a-cadence");
+        let error = parse_failure(&unknown_variant);
+        assert_eq!(
+            mission_parse_field(&unknown_variant, &error),
+            Some("cadence")
+        );
+
+        let mut wrong_type = baseline_mission_value();
+        wrong_type["max_threads_per_day"] = serde_json::json!("many");
+        let error = parse_failure(&wrong_type);
+        assert_eq!(
+            mission_parse_field(&wrong_type, &error),
+            Some("max_threads_per_day")
+        );
+
+        let mut bad_id = baseline_mission_value();
+        bad_id["id"] = serde_json::json!("not-a-uuid");
+        let error = parse_failure(&bad_id);
+        assert_eq!(mission_parse_field(&bad_id, &error), Some("id"));
+
+        // A missing required field is named by serde itself.
+        let mut missing = baseline_mission_value();
+        missing.as_object_mut().expect("object").remove("goal");
+        let error = parse_failure(&missing);
+        assert_eq!(mission_parse_field(&missing, &error), Some("goal"));
+
+        // Nothing locatable (the document is not even an object) and a valid
+        // document at a forged error both stay silent instead of guessing.
+        let error = parse_failure(&serde_json::json!([1, 2, 3]));
+        assert_eq!(
+            mission_parse_field(&serde_json::json!([1, 2, 3]), &error),
+            None
+        );
+        let valid = baseline_mission_value();
+        let forged = <serde_json::Error as serde::de::Error>::custom("forged");
+        assert_eq!(mission_parse_field(&valid, &forged), None);
+    }
+
+    #[test]
+    fn parse_mission_document_reports_positions_and_keeps_duplicate_keys_loadable() {
+        // WI#930: the two-pass load reported line=0 column=0 for every data
+        // error because `from_value` has no source position.
+        let mut raw = baseline_mission_value();
+        raw["cadence"] = serde_json::json!("not-a-cadence");
+        let content = raw.to_string();
+        let raw: serde_json::Value = serde_json::from_str(&content).expect("value");
+        let error = parse_mission_document(&content, &raw).expect_err("invalid cadence");
+        assert_eq!(error.line(), 1, "one-line document: {error}");
+        assert!(
+            error.column() > 0,
+            "the parser must report a column: {error}"
+        );
+
+        // `Value` resolves duplicate keys last-wins while a direct struct
+        // parse rejects them. Such a record loaded before this split, so the
+        // compatibility fallback must keep accepting it.
+        let content = serde_json::to_string(&baseline_mission_value()).expect("mission json");
+        let duplicated = content.replacen("{", "{\"name\":\"duplicate\",", 1);
+        let raw: serde_json::Value = serde_json::from_str(&duplicated).expect("value");
+        assert!(
+            serde_json::from_str::<Mission>(&duplicated).is_err(),
+            "the fixture must be rejected by a direct parse"
+        );
+        assert!(parse_mission_document(&duplicated, &raw).is_ok());
+    }
+
     #[test]
     fn canonical_default_project_ignores_non_default_projects() {
         // The picker is fed the caller's whole project list, so only projects
@@ -3053,6 +3216,31 @@ mod tests {
                     &mission_id,
                     &path,
                     "error_kind=data",
+                    "field=\"cadence\"",
+                    "line=1",
+                    "content_bytes=",
+                ],
+            )?;
+            // WI#930: `from_value` reported line=0 column=0 for every data
+            // error, which hid where the document went wrong.
+            let warn_line = lines
+                .iter()
+                .find(|line| {
+                    line_has_level(line, "WARN")
+                        && line.contains("dropping mission: failed to parse")
+                })
+                .ok_or_else(|| format!("missing mission parse warning: {lines:?}"))?;
+            if warn_line.contains("line=0") || warn_line.contains("column=0") {
+                return Err(format!(
+                    "mission parse warning must carry a real source position: {warn_line}"
+                ));
+            }
+            assert_logged_at(
+                lines,
+                "WARN",
+                &[
+                    "engine boot: unparseable mission records",
+                    "mission_records=1",
                 ],
             )?;
             // OA-8: the required operator path legitimately carries the slugged
@@ -3392,6 +3580,7 @@ mod tests {
                     &mission_id,
                     &path,
                     "error_kind=data",
+                    "field=\"goal\"",
                     "missing_field=\"goal\"",
                 ],
             )?;
