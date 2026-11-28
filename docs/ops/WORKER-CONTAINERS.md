@@ -4974,8 +4974,11 @@ this check. The `2.8.1` tarball still resolves to
 with `sha512-v64td7IvZp4Kd7LTNDs/KvTT/4QERkLNp2qZpJhYDOyb6ZwQDQgleo3qvTKbAg7nkWZjWx/ZNLhuhe2A+WLZqw==`,
 the value [note 23620](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23620)
 verified against the downloaded tarball and the temporary lock; its Node
-requirement is still `>=22.19.0`. The committed lock is unchanged and still
-pins `2.7.2`.
+requirement is still `>=22.19.0`. The committed lock
+(`kimicode4lunarwing/kimi-cli/package-lock.json`) is unchanged and still pins
+`2.7.2` at `https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.7.2.tgz`
+with `sha512-Eq7512ssQH632Tg7C1LIK10CykToqF2lpBdkFjJ1IjSV86fMjEHpwxuKoo6fjh5XpCbwtKwijB0hTTbyDRLM9w==`,
+matching `kimicode4lunarwing/kimi-cli/package.json`.
 
 **Why neither candidate is taken.** The blocking items are maintainer
 decisions, not verification gaps: the Kimi interaction/cross-session and
