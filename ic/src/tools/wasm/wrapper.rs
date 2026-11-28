@@ -5745,6 +5745,128 @@ mod tests {
         }
     }
 
+    fn mock_gotify_capabilities(sidecar: &str, base_url: &str) -> Capabilities {
+        use crate::tools::wasm::{CapabilitiesFile, EndpointPattern};
+
+        let mut caps = CapabilitiesFile::from_json(sidecar)
+            .expect("parse Gotify capabilities")
+            .to_capabilities();
+        let http = caps.http.as_mut().expect("Gotify HTTP capability");
+        http.allowlist = vec![
+            EndpointPattern::host("127.0.0.1")
+                .with_path_prefix("/message")
+                .with_methods(vec!["POST".into()]),
+        ];
+        http.credentials
+            .get_mut("gotify_app_token")
+            .expect("Gotify credential mapping")
+            .host_patterns = vec!["127.0.0.1".into()];
+        let reader = super::PreloadedWorkspaceReader {
+            data: HashMap::from([(
+                super::GOTIFY_CONFIG_PATH.to_string(),
+                json!({"url": base_url}).to_string(),
+            )]),
+        };
+        caps.workspace_read
+            .as_mut()
+            .expect("Gotify workspace capability")
+            .reader = Some(Arc::new(reader));
+        caps
+    }
+
+    /// Run from `ic/` with a freshly built Gotify component and a loopback receiver.
+    ///
+    /// ```bash
+    /// taskset -c 0-17 cargo build -j18 --locked --release --target wasm32-wasip2 \
+    ///   --manifest-path tools-src/gotify/Cargo.toml
+    /// WASM_HTTP_ALLOW_PRIVATE_IPS=1 NO_PROXY=127.0.0.1 \
+    ///   taskset -c 0-17 cargo test -j18 --locked --release --lib gotify_priority_contract -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires the built Gotify component and the loopback HTTP opt-in"]
+    async fn gotify_priority_contract() {
+        use axum::http::StatusCode;
+        use serde_json::Value;
+        use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+
+        use crate::tools::prepare_tool_params;
+        use crate::tools::wasm::ResourceLimits;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock receiver");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("mock receiver address")
+        );
+        let (tx, mut received) = unbounded_channel();
+        let receiver = Router::new()
+            .route(
+                "/message",
+                post(
+                    |State(tx): State<UnboundedSender<Value>>, Json(body): Json<Value>| async move {
+                        tx.send(body).expect("record Gotify request");
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(tx);
+        let server = tokio::spawn(async move { axum::serve(listener, receiver).await });
+
+        let sidecar = include_str!("../../../tools-src/gotify/gotify.capabilities.json");
+        let metadata: Value = serde_json::from_str(sidecar).expect("parse Gotify metadata");
+        let caps = mock_gotify_capabilities(sidecar, &base_url);
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools-src/gotify");
+        let wasm_path = crate::tools::wasm::wasm_artifact_path(&source, "gotify_tool");
+        let wasm_bytes = std::fs::read(&wasm_path)
+            .unwrap_or_else(|err| panic!("build Gotify first ({}): {err}", wasm_path.display()));
+        let mut config = WasmRuntimeConfig::for_testing();
+        config.default_limits = ResourceLimits::default();
+        let runtime = Arc::new(WasmToolRuntime::new(config).expect("initialize WASM runtime"));
+        let prepared = runtime
+            .prepare("gotify", &wasm_bytes, None)
+            .await
+            .expect("prepare Gotify");
+        let store = Arc::new(test_secrets_store());
+        store
+            .create(
+                "gotify-test",
+                CreateSecretParams::new("gotify_app_token", TEST_BEARER_TOKEN_123),
+            )
+            .await
+            .expect("store fixture credential");
+        let tool = super::WasmToolWrapper::new(runtime, prepared, caps).with_secrets_store(store);
+        let ctx = JobContext::with_user("gotify-test", "gotify priority", "gotify priority");
+        let priority_default = "/properties/priority/default";
+        assert_eq!(
+            metadata["tools"][0]["parameters"].pointer(priority_default),
+            Some(&json!(9)),
+            "packaged priority default"
+        );
+        assert_eq!(
+            tool.discovery_schema().pointer(priority_default),
+            Some(&json!(9)),
+            "guest priority default"
+        );
+
+        for (input, expected) in [
+            (json!({"message": "omitted"}), 9),
+            (json!({"message": "explicit", "priority": "5"}), 5),
+        ] {
+            let params = prepare_tool_params(&tool, &input);
+            let output = tool
+                .execute(params, &ctx)
+                .await
+                .expect("send Gotify notification");
+            assert_eq!(output.result["success"], true);
+            let body = received.try_recv().expect("receiver got a POST /message");
+            assert_eq!(body["message"], input["message"]);
+            assert_eq!(body["priority"], expected);
+        }
+        assert!(received.is_empty(), "unexpected extra Gotify POST");
+        server.abort();
+    }
+
     #[test]
     fn test_host_provisioned_workspace_config_is_gotify_only() {
         let config_prefix = ["config/".to_string()];
