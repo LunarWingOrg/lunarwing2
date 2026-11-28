@@ -146,10 +146,12 @@ fn matches_bridge_origin(raw_url: &str, allowed_origins: &[String]) -> bool {
     })
 }
 
-fn is_long_poll_wait_endpoint(raw_url: &str) -> bool {
-    url::Url::parse(raw_url)
-        .ok()
-        .is_some_and(|url| url.path() == "/api/wait")
+fn is_weechat_wait_endpoint(channel_name: &str, method: &str, raw_url: &str) -> bool {
+    channel_name == "weechat"
+        && method.eq_ignore_ascii_case("GET")
+        && url::Url::parse(raw_url)
+            .ok()
+            .is_some_and(|url| url.path() == "/api/wait")
 }
 
 /// Store data for WASM channel execution.
@@ -715,7 +717,8 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
         // values in deny reasons; response headers can echo the form-encoded
         // query-param credential via a redirect `Location`; response bodies
         // echo the redirect target URL on common 3xx edges.
-        let is_wait_endpoint = is_long_poll_wait_endpoint(&url);
+        let is_wait_endpoint =
+            is_weechat_wait_endpoint(self.host_state.channel_name(), &method, &url);
         let outcome = self.http_request_inner(method, url, headers_json, body, timeout_ms);
         if is_wait_endpoint && matches!(&outcome, Ok(response) if response.status == 401) {
             self.wait_auth_rejected = true;
@@ -899,7 +902,9 @@ impl WasmChannelHealthState {
             Self::StartupDegraded => Some("startup callback reported a warning or error"),
             Self::PollFailed => Some("polling callback persistently failing"),
             Self::PollDispatchFailed => Some("polling callback output could not be delivered"),
-            Self::PollAuthFailed => Some("polling authentication rejected; credentials need refresh"),
+            Self::PollAuthFailed => {
+                Some("polling authentication rejected; credentials need refresh")
+            }
         }
     }
 }
@@ -1319,12 +1324,22 @@ impl WasmChannel {
 
     /// Set a credential for URL injection and wake authentication-paused polling.
     pub async fn set_credential(&self, name: &str, value: String) {
-        self.credentials
-            .write()
-            .await
-            .insert(name.to_string(), value);
-        self.credential_updates
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        let changed = {
+            let mut credentials = self.credentials.write().await;
+            if credentials
+                .get(name)
+                .is_some_and(|current| current == &value)
+            {
+                false
+            } else {
+                credentials.insert(name.to_string(), value);
+                true
+            }
+        };
+        if changed {
+            self.credential_updates
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
     }
 
     /// Get a snapshot of credentials for use in callbacks.
@@ -1585,9 +1600,24 @@ impl WasmChannel {
     }
 
     fn reset_poll_health(&self) {
-        self.consecutive_poll_failures
-            .store(0, std::sync::atomic::Ordering::Release);
-        self.set_callback_health(WasmChannelHealthState::Healthy);
+        Self::reset_poll_health_shared(
+            &self.consecutive_poll_failures,
+            &self.callback_health,
+            &self.auth_failure_logged,
+        );
+    }
+
+    fn reset_poll_health_shared(
+        failures: &std::sync::atomic::AtomicU32,
+        health: &std::sync::atomic::AtomicU8,
+        auth_logged: &std::sync::atomic::AtomicBool,
+    ) {
+        failures.store(0, std::sync::atomic::Ordering::Release);
+        auth_logged.store(false, std::sync::atomic::Ordering::Release);
+        health.store(
+            WasmChannelHealthState::Healthy as u8,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     fn record_poll_failure(&self, state: WasmChannelHealthState) {
@@ -1606,6 +1636,17 @@ impl WasmChannel {
         let count = failures.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
         if count >= POLL_FAILURE_HEALTH_THRESHOLD {
             health.store(state as u8, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    async fn wait_for_auth_credential_update(updates: &mut watch::Receiver<u64>) -> bool {
+        match updates.has_changed() {
+            Ok(true) => {
+                updates.borrow_and_update();
+                true
+            }
+            Ok(false) => updates.changed().await.is_ok(),
+            Err(_) => false,
         }
     }
 
@@ -1744,11 +1785,13 @@ impl WasmChannel {
                 return Err(error);
             }
         };
-        self.set_callback_health(if degraded {
-            WasmChannelHealthState::StartupDegraded
-        } else {
-            WasmChannelHealthState::Healthy
-        });
+        if self.callback_health() != WasmChannelHealthState::PollAuthFailed {
+            self.set_callback_health(if degraded {
+                WasmChannelHealthState::StartupDegraded
+            } else {
+                WasmChannelHealthState::Healthy
+            });
+        }
         tracing::info!(
             channel = %self.name,
             display_name = %config.display_name,
@@ -1936,6 +1979,7 @@ impl WasmChannel {
     fn collect_poll_execution(
         channel_name: &str,
         mut host_state: ChannelHostState,
+        auth_failed: bool,
     ) -> PollExecution {
         let degraded = Self::log_callback_entries(channel_name, host_state.take_logs());
         let emits_dropped = host_state.emits_dropped();
@@ -1956,6 +2000,7 @@ impl WasmChannel {
             pending_writes: host_state.take_pending_writes(),
             degraded,
             emits_dropped,
+            auth_failed,
         }
     }
 
@@ -1969,7 +2014,8 @@ impl WasmChannel {
             pending_writes,
             degraded,
             emits_dropped,
-        } = Self::collect_poll_execution(channel_name, host_state);
+            auth_failed: _,
+        } = Self::collect_poll_execution(channel_name, host_state, false);
 
         // Dispatch and persist before reporting an overflow: the accepted page
         // and the guest cursor write must survive so the next poll resumes
@@ -2045,10 +2091,11 @@ impl WasmChannel {
                     .call_on_poll(&mut store)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
+                let auth_failed = store.data().wait_auth_rejected;
                 let host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
 
-                Ok(((), host_state))
+                Ok(((), host_state, auth_failed))
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
@@ -2060,7 +2107,19 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), host_state))) => self.finish_poll_callback(&channel_name, host_state).await,
+            Ok(Ok(((), mut host_state, true))) => {
+                self.log_callback_host_state(&mut host_state);
+                self.set_callback_health(WasmChannelHealthState::PollAuthFailed);
+                Err(WasmChannelError::CallbackFailed {
+                    name: channel_name,
+                    reason:
+                        "WeeChat /api/wait authentication rejected; refresh channel credentials"
+                            .to_string(),
+                })
+            }
+            Ok(Ok(((), host_state, false))) => {
+                self.finish_poll_callback(&channel_name, host_state).await
+            }
             Ok(Err(error)) => {
                 self.record_poll_failure(WasmChannelHealthState::PollFailed);
                 Err(error)
@@ -2754,220 +2813,32 @@ impl WasmChannel {
     }
 
     /// Start the supervised polling loop.
-    ///
-    /// Spawns an outer supervision task that monitors an inner polling loop.
-    /// If the inner loop exits unexpectedly (panic, error), the supervisor
-    /// respawns it with exponential backoff. The JoinHandle is stored so
-    /// `health_check()` can detect a dead supervisor.
     async fn start_polling(&self, interval: Duration, shutdown_rx: oneshot::Receiver<()>) {
-        let channel_name = self.name.clone();
-        let runtime = Arc::clone(&self.runtime);
-        let prepared = Arc::clone(&self.prepared);
-        let poll_capabilities = self.capabilities.clone();
-        let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
-        let message_tx = self.message_tx.clone();
-        let rate_limiter = self.rate_limiter.clone();
-        let credentials = self.credentials.clone();
-        let pairing_store = self.pairing_store.clone();
-        let allowed_bridge_origins = self.allowed_bridge_origins.clone();
-        let callback_timeout = self.runtime.config().callback_timeout;
-        let workspace_store = self.workspace_store.clone();
-        let last_broadcast_metadata = self.last_broadcast_metadata.clone();
-        let settings_store = self.settings_store.clone();
-        let poll_secrets_store = self.secrets_store.clone();
-        let owner_scope_id = self.owner_scope_id.clone();
-        let owner_actor_id = self.owner_actor_id.clone();
-        let last_poll_epoch_ms = Arc::clone(&self.last_poll_epoch_ms);
-        let callback_health = Arc::clone(&self.callback_health);
-        let consecutive_poll_failures = Arc::clone(&self.consecutive_poll_failures);
-
-        let handle = tokio::spawn(async move {
-            let mut shutdown = std::pin::pin!(shutdown_rx);
-            let mut consecutive_failures: u32 = 0;
-
-            loop {
-                let inner_handle = {
-                    let cn = channel_name.clone();
-                    let rt = Arc::clone(&runtime);
-                    let prep = Arc::clone(&prepared);
-                    let pc = poll_capabilities.clone();
-                    let caps = capabilities.clone();
-                    let mtx = message_tx.clone();
-                    let rl = rate_limiter.clone();
-                    let creds = credentials.clone();
-                    let ps = pairing_store.clone();
-                    let bridge_origins = allowed_bridge_origins.clone();
-                    let ws = workspace_store.clone();
-                    let lbm = last_broadcast_metadata.clone();
-                    let ss = settings_store.clone();
-                    let pss = poll_secrets_store.clone();
-                    let osi = owner_scope_id.clone();
-                    let oai = owner_actor_id.clone();
-                    let lpe = Arc::clone(&last_poll_epoch_ms);
-                    let health = Arc::clone(&callback_health);
-                    let poll_failures = Arc::clone(&consecutive_poll_failures);
-
-                    tokio::spawn(async move {
-                        let mut interval_timer = tokio::time::interval(interval);
-                        // A slow poll cycle (e.g. an adapter round-trip approaching the
-                        // callback timeout) must not queue up a burst of catch-up ticks.
-                        // Skip missed ticks so cadence stays ~= the configured interval
-                        // instead of firing back-to-back after a slow cycle.
-                        interval_timer
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                        loop {
-                            interval_timer.tick().await;
-
-                            tracing::debug!(channel = %cn, "Polling tick - calling on_poll");
-
-                            let host_credentials =
-                                resolve_channel_host_credentials(&cn, &pc, pss.as_deref(), &osi)
-                                    .await;
-
-                            let result = Self::execute_poll(
-                                &cn,
-                                &rt,
-                                &prep,
-                                &caps,
-                                &creds,
-                                host_credentials,
-                                ps.clone(),
-                                bridge_origins.clone(),
-                                callback_timeout,
-                                &ws,
-                            )
-                            .await;
-
-                            match result {
-                                Ok(execution) => {
-                                    let PollExecution {
-                                        emitted_messages,
-                                        pending_writes,
-                                        degraded,
-                                        emits_dropped,
-                                    } = execution;
-                                    let dispatch_result = if emitted_messages.is_empty() {
-                                        Ok(())
-                                    } else {
-                                        Self::dispatch_emitted_messages(
-                                            EmitDispatchContext {
-                                                channel_name: &cn,
-                                                owner_scope_id: &osi,
-                                                owner_actor_id: oai.as_deref(),
-                                                message_tx: &mtx,
-                                                rate_limiter: &rl,
-                                                last_broadcast_metadata: &lbm,
-                                                settings_store: ss.as_ref(),
-                                            },
-                                            emitted_messages,
-                                        )
-                                        .await
-                                    };
-                                    match dispatch_result {
-                                        Ok(()) => {
-                                            // Commit even when the callback
-                                            // overflowed: the guest cursor
-                                            // write must advance past the page
-                                            // that was just dispatched, or the
-                                            // next tick replays it (WI#850).
-                                            ws.commit_writes(&pending_writes);
-                                            if degraded || emits_dropped > 0 {
-                                                Self::record_poll_failure_shared(
-                                                    &poll_failures,
-                                                    &health,
-                                                    WasmChannelHealthState::PollFailed,
-                                                );
-                                            } else {
-                                                poll_failures
-                                                    .store(0, std::sync::atomic::Ordering::Release);
-                                                lpe.store(
-                                                    std::time::SystemTime::now()
-                                                        .duration_since(std::time::UNIX_EPOCH)
-                                                        .unwrap_or_default()
-                                                        .as_millis()
-                                                        as u64,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
-                                                health.store(
-                                                    WasmChannelHealthState::Healthy as u8,
-                                                    std::sync::atomic::Ordering::Release,
-                                                );
-                                            }
-                                        }
-                                        Err(error) => {
-                                            Self::record_poll_failure_shared(
-                                                &poll_failures,
-                                                &health,
-                                                WasmChannelHealthState::PollDispatchFailed,
-                                            );
-                                            tracing::warn!(
-                                                channel = %cn, error = %error,
-                                                "Failed to dispatch emitted messages from poll; workspace writes not committed"
-                                            );
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    Self::record_poll_failure_shared(
-                                        &poll_failures,
-                                        &health,
-                                        WasmChannelHealthState::PollFailed,
-                                    );
-                                    tracing::warn!(
-                                        channel = %cn, error = %error,
-                                        "Polling callback failed"
-                                    );
-                                }
-                            }
-                        }
-                    })
-                };
-
-                tokio::select! {
-                    result = inner_handle => {
-                        match result {
-                            Ok(()) => {
-                                tracing::warn!(
-                                    channel = %channel_name,
-                                    "Polling loop exited unexpectedly"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    channel = %channel_name,
-                                    error = %e,
-                                    "Polling loop panicked"
-                                );
-                            }
-                        }
-                        callback_health.store(
-                            WasmChannelHealthState::PollFailed as u8,
-                            std::sync::atomic::Ordering::Release,
-                        );
-                        consecutive_failures += 1;
-                        let backoff_secs = 2u64
-                            .saturating_pow(consecutive_failures.min(6))
-                            .min(120);
-                        tracing::error!(
-                            channel = %channel_name,
-                            attempt = consecutive_failures,
-                            backoff_secs,
-                            "Respawning polling loop after backoff"
-                        );
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    }
-                    _ = &mut shutdown => {
-                        tracing::info!(
-                            channel = %channel_name,
-                            "Polling stopped (shutdown signal)"
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-
+        let context = PollingContext {
+            channel_name: self.name.clone(),
+            runtime: Arc::clone(&self.runtime),
+            prepared: Arc::clone(&self.prepared),
+            poll_capabilities: self.capabilities.clone(),
+            capabilities: Self::inject_workspace_reader(&self.capabilities, &self.workspace_store),
+            message_tx: Arc::clone(&self.message_tx),
+            rate_limiter: Arc::clone(&self.rate_limiter),
+            credentials: Arc::clone(&self.credentials),
+            pairing_store: Arc::clone(&self.pairing_store),
+            allowed_bridge_origins: self.allowed_bridge_origins.clone(),
+            callback_timeout: self.runtime.config().callback_timeout,
+            workspace_store: Arc::clone(&self.workspace_store),
+            last_broadcast_metadata: Arc::clone(&self.last_broadcast_metadata),
+            settings_store: self.settings_store.clone(),
+            secrets_store: self.secrets_store.clone(),
+            owner_scope_id: self.owner_scope_id.clone(),
+            owner_actor_id: self.owner_actor_id.clone(),
+            last_poll_epoch_ms: Arc::clone(&self.last_poll_epoch_ms),
+            callback_health: Arc::clone(&self.callback_health),
+            consecutive_poll_failures: Arc::clone(&self.consecutive_poll_failures),
+            auth_failure_logged: Arc::clone(&self.auth_failure_logged),
+            credential_updates: self.credential_updates.clone(),
+        };
+        let handle = tokio::spawn(supervise_polling(context, interval, shutdown_rx));
         *self.poll_task.write().await = Some(handle);
     }
 
@@ -3028,10 +2899,11 @@ impl WasmChannel {
                     .call_on_poll(&mut store)
                     .map_err(|e| Self::map_wasm_error(e, &prepared.name, prepared.limits.fuel))?;
 
+                let auth_failed = store.data().wait_auth_rejected;
                 let host_state =
                     Self::extract_host_state(&mut store, &prepared.name, &capabilities);
 
-                Ok(host_state)
+                Ok((host_state, auth_failed))
             })
             .await
             .map_err(|e| WasmChannelError::ExecutionPanicked {
@@ -3042,7 +2914,11 @@ impl WasmChannel {
         .await;
 
         match result {
-            Ok(Ok(host_state)) => Ok(Self::collect_poll_execution(channel_name, host_state)),
+            Ok(Ok((host_state, auth_failed))) => Ok(Self::collect_poll_execution(
+                channel_name,
+                host_state,
+                auth_failed,
+            )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(WasmChannelError::Timeout {
                 name: channel_name.to_string(),
@@ -3203,6 +3079,32 @@ impl WasmChannel {
     }
 }
 
+#[derive(Clone)]
+struct PollingContext {
+    channel_name: String,
+    runtime: Arc<WasmChannelRuntime>,
+    prepared: Arc<PreparedChannelModule>,
+    poll_capabilities: ChannelCapabilities,
+    capabilities: ChannelCapabilities,
+    message_tx: Arc<RwLock<Option<mpsc::Sender<IncomingMessage>>>>,
+    rate_limiter: Arc<RwLock<ChannelEmitRateLimiter>>,
+    credentials: Arc<RwLock<HashMap<String, String>>>,
+    pairing_store: Arc<PairingStore>,
+    allowed_bridge_origins: SharedBridgeOrigins,
+    callback_timeout: Duration,
+    workspace_store: Arc<ChannelWorkspaceStore>,
+    last_broadcast_metadata: Arc<tokio::sync::RwLock<Option<String>>>,
+    settings_store: Option<Arc<dyn crate::db::SettingsStore>>,
+    secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    owner_scope_id: String,
+    owner_actor_id: Option<String>,
+    last_poll_epoch_ms: Arc<std::sync::atomic::AtomicU64>,
+    callback_health: Arc<std::sync::atomic::AtomicU8>,
+    consecutive_poll_failures: Arc<std::sync::atomic::AtomicU32>,
+    auth_failure_logged: Arc<std::sync::atomic::AtomicBool>,
+    credential_updates: watch::Sender<u64>,
+}
+
 struct EmitDispatchContext<'a> {
     channel_name: &'a str,
     owner_scope_id: &'a str,
@@ -3224,6 +3126,204 @@ struct PollExecution {
     /// non-zero count marks the tick unhealthy instead of throwing the batch
     /// away (WI#850).
     emits_dropped: usize,
+    /// The WeeChat /api/wait endpoint rejected the configured credential.
+    auth_failed: bool,
+}
+
+async fn run_poll_tick(context: &PollingContext) -> bool {
+    tracing::debug!(channel = %context.channel_name, "Polling tick - calling on_poll");
+    let host_credentials = resolve_channel_host_credentials(
+        &context.channel_name,
+        &context.poll_capabilities,
+        context.secrets_store.as_deref(),
+        &context.owner_scope_id,
+    )
+    .await;
+    let result = WasmChannel::execute_poll(
+        &context.channel_name,
+        &context.runtime,
+        &context.prepared,
+        &context.capabilities,
+        &context.credentials,
+        host_credentials,
+        Arc::clone(&context.pairing_store),
+        context.allowed_bridge_origins.clone(),
+        context.callback_timeout,
+        &context.workspace_store,
+    )
+    .await;
+
+    match result {
+        Ok(execution) => {
+            if execution.auth_failed {
+                return true;
+            }
+            dispatch_poll_execution(context, execution).await;
+            false
+        }
+        Err(error) => {
+            WasmChannel::record_poll_failure_shared(
+                &context.consecutive_poll_failures,
+                &context.callback_health,
+                WasmChannelHealthState::PollFailed,
+            );
+            tracing::warn!(
+                channel = %context.channel_name,
+                error = %error,
+                "Polling callback failed"
+            );
+            false
+        }
+    }
+}
+
+async fn dispatch_poll_execution(context: &PollingContext, execution: PollExecution) {
+    let PollExecution {
+        emitted_messages,
+        pending_writes,
+        degraded,
+        emits_dropped,
+        auth_failed: _,
+    } = execution;
+    let dispatch_result = if emitted_messages.is_empty() {
+        Ok(())
+    } else {
+        WasmChannel::dispatch_emitted_messages(
+            EmitDispatchContext {
+                channel_name: &context.channel_name,
+                owner_scope_id: &context.owner_scope_id,
+                owner_actor_id: context.owner_actor_id.as_deref(),
+                message_tx: &context.message_tx,
+                rate_limiter: &context.rate_limiter,
+                last_broadcast_metadata: &context.last_broadcast_metadata,
+                settings_store: context.settings_store.as_ref(),
+            },
+            emitted_messages,
+        )
+        .await
+    };
+
+    match dispatch_result {
+        Ok(()) => {
+            context.workspace_store.commit_writes(&pending_writes);
+            if degraded || emits_dropped > 0 {
+                WasmChannel::record_poll_failure_shared(
+                    &context.consecutive_poll_failures,
+                    &context.callback_health,
+                    WasmChannelHealthState::PollFailed,
+                );
+            } else {
+                WasmChannel::reset_poll_health_shared(
+                    &context.consecutive_poll_failures,
+                    &context.callback_health,
+                    &context.auth_failure_logged,
+                );
+                context.last_poll_epoch_ms.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
+            }
+        }
+        Err(error) => {
+            WasmChannel::record_poll_failure_shared(
+                &context.consecutive_poll_failures,
+                &context.callback_health,
+                WasmChannelHealthState::PollDispatchFailed,
+            );
+            tracing::warn!(
+                channel = %context.channel_name,
+                error = %error,
+                "Failed to dispatch emitted messages from poll; workspace writes not committed"
+            );
+        }
+    }
+}
+
+async fn run_polling_loop(context: PollingContext, interval: Duration) -> bool {
+    let mut timer = tokio::time::interval(interval);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        if run_poll_tick(&context).await {
+            return true;
+        }
+    }
+}
+
+async fn supervise_polling(
+    context: PollingContext,
+    interval: Duration,
+    shutdown_rx: oneshot::Receiver<()>,
+) {
+    let mut shutdown = std::pin::pin!(shutdown_rx);
+    let mut recovery_updates = context.credential_updates.subscribe();
+    let mut consecutive_failures = 0_u32;
+
+    loop {
+        let child_context = context.clone();
+        let mut inner_handle = tokio::spawn(run_polling_loop(child_context, interval));
+        tokio::select! {
+            result = &mut inner_handle => {
+                match result {
+                    Ok(true) => {
+                        context.callback_health.store(
+                            WasmChannelHealthState::PollAuthFailed as u8,
+                            std::sync::atomic::Ordering::Release,
+                        );
+                        if !context.auth_failure_logged.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            tracing::warn!(
+                                channel = %context.channel_name,
+                                "weechat /api/wait: auth rejected — re-authentication needed; polling paused until credentials change"
+                            );
+                        }
+                        let recovered = tokio::select! {
+                            changed = WasmChannel::wait_for_auth_credential_update(&mut recovery_updates) => changed,
+                            _ = &mut shutdown => false,
+                        };
+                        if !recovered {
+                            break;
+                        }
+                        consecutive_failures = 0;
+                        continue;
+                    }
+                    Ok(false) => tracing::warn!(
+                        channel = %context.channel_name,
+                        "Polling loop exited unexpectedly"
+                    ),
+                    Err(error) => tracing::error!(
+                        channel = %context.channel_name,
+                        error = %error,
+                        "Polling loop panicked"
+                    ),
+                }
+                context.callback_health.store(
+                    WasmChannelHealthState::PollFailed as u8,
+                    std::sync::atomic::Ordering::Release,
+                );
+                consecutive_failures += 1;
+                let backoff = 2_u64.saturating_pow(consecutive_failures.min(6)).min(120);
+                tracing::error!(
+                    channel = %context.channel_name,
+                    attempt = consecutive_failures,
+                    backoff_secs = backoff,
+                    "Respawning polling loop after backoff"
+                );
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                    _ = &mut shutdown => break,
+                }
+            }
+            _ = &mut shutdown => {
+                inner_handle.abort();
+                let _ = inner_handle.await;
+                tracing::info!(channel = %context.channel_name, "Polling stopped (shutdown signal)");
+                break;
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -4179,8 +4279,8 @@ mod tests {
     use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
         ChannelStoreData, EmitDispatchContext, HttpResponse, POLL_FAILURE_HEALTH_THRESHOLD,
-        WasmChannel, WasmChannelHealthState, resolve_owner_broadcast_target, status_to_wit,
-        uses_owner_broadcast_target,
+        WasmChannel, WasmChannelHealthState, is_weechat_wait_endpoint,
+        resolve_owner_broadcast_target, status_to_wit, uses_owner_broadcast_target,
     };
     use crate::pairing::PairingStore;
     use crate::testing::credentials::TEST_COLON_FORMAT_TOKEN;
@@ -4957,7 +5057,7 @@ mod tests {
             .workspace_write("cursor.txt", "42".to_string())
             .expect("cursor write is queued");
 
-        let execution = WasmChannel::collect_poll_execution("test", host_state);
+        let execution = WasmChannel::collect_poll_execution("test", host_state, false);
 
         assert_eq!(
             execution.emitted_messages.len(),
@@ -6460,6 +6560,62 @@ mod tests {
         let msg = rx.try_recv().expect("Should receive message"); // safety: test-only assertion
         assert_eq!(msg.content, "Just text, no attachments"); // safety: test-only assertion
         assert!(msg.attachments.is_empty()); // safety: test-only assertion
+    }
+
+    #[test]
+    fn weechat_wait_auth_detection_is_scoped_to_get_endpoint() {
+        assert!(is_weechat_wait_endpoint(
+            "weechat",
+            "GET",
+            "http://127.0.0.1:6681/api/wait?cursor=7"
+        ));
+        assert!(!is_weechat_wait_endpoint(
+            "weechat",
+            "POST",
+            "http://127.0.0.1:6681/api/wait"
+        ));
+        assert!(!is_weechat_wait_endpoint(
+            "xmpp",
+            "GET",
+            "http://127.0.0.1:6681/api/wait"
+        ));
+        assert!(!is_weechat_wait_endpoint(
+            "weechat",
+            "GET",
+            "http://127.0.0.1:6681/api/health"
+        ));
+    }
+
+    #[tokio::test]
+    async fn credential_update_wakes_auth_recovery_wait() {
+        let channel = create_test_channel();
+        let mut updates = channel.credential_updates.subscribe();
+        let waiter = tokio::spawn(async move {
+            WasmChannel::wait_for_auth_credential_update(&mut updates).await
+        });
+
+        channel
+            .set_credential("TEST_TOKEN", "new-value".to_string())
+            .await;
+
+        assert!(waiter.await.expect("auth recovery waiter should finish"));
+    }
+
+    #[tokio::test]
+    async fn auth_health_is_actionable_and_clears_after_reset() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+        channel.set_callback_health(WasmChannelHealthState::PollAuthFailed);
+
+        let error = channel
+            .health_check()
+            .await
+            .expect_err("rejected wait authentication must fail health")
+            .to_string();
+        assert!(error.contains("credentials need refresh"), "{error}");
+
+        channel.reset_poll_health();
+        assert!(channel.health_check().await.is_ok());
     }
 
     #[test]
