@@ -1669,11 +1669,16 @@ const MISSION_SCHEMA_FIELDS: &[&str] = &[
     "max_delay_secs",
 ];
 
-/// Data errors have no source position, but an allowlisted missing-field name
-/// is safe to expose. Unknown variants and invalid values remain unreported.
+/// An allowlisted missing-field name from a data error, safe to expose.
+///
+/// Unknown variants and invalid values name stored content, so they remain
+/// unreported. `serde_json` appends ` at line N column M` when the input came
+/// from source text (WI#930), so the name is delimited by its backticks rather
+/// than by the end of the message.
 fn mission_missing_field(error: &serde_json::Error) -> Option<&'static str> {
     let message = error.to_string();
-    let field = message.strip_prefix("missing field `")?.strip_suffix('`')?;
+    let rest = message.strip_prefix("missing field `")?;
+    let field = &rest[..rest.find('`')?];
     MISSION_SCHEMA_FIELDS
         .iter()
         .copied()
@@ -2925,6 +2930,25 @@ mod tests {
             .remove("goal");
         let missing = serde_json::from_value::<Mission>(raw).expect_err("missing goal");
         assert_eq!(mission_missing_field(&missing), Some("goal"));
+
+        // WI#930: a source-text parse appends ` at line N column M`, which
+        // must not hide the field name.
+        let mut positioned_raw = serde_json::to_value(Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "incomplete",
+            "keep working",
+            lunarwing_engine::MissionCadence::Manual,
+        ))
+        .expect("mission json");
+        positioned_raw
+            .as_object_mut()
+            .expect("mission should be an object")
+            .remove("goal");
+        let positioned =
+            serde_json::from_str::<Mission>(&positioned_raw.to_string()).expect_err("missing goal");
+        assert!(positioned.to_string().contains(" at line "));
+        assert_eq!(mission_missing_field(&positioned), Some("goal"));
 
         let forged =
             <serde_json::Error as serde::de::Error>::custom("missing field `stored_user_content`");
