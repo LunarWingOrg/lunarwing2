@@ -1312,6 +1312,9 @@ fn do_longpoll(adapter_url: &str, relay_password: &str) {
             );
             let _ = channel_host::workspace_write(INGEST_MODE_PATH, "poll");
         }
+        Ok(resp) if resp.status == 401 => {
+            // The host pauses polling and reports the credential error once.
+        }
         Ok(resp) => {
             channel_host::log(
                 channel_host::LogLevel::Warn,
