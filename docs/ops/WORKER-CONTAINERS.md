@@ -4950,3 +4950,78 @@ decisions, including what replaces the removed `mcp_events` gate; there is no
 bumped image for `console_policy_eval.py`. OpenCode v1 `v1.19.6` is still the
 newest stable v1 tag. Re-check the releases and run the full bump checklist on
 the reviewed revision before promoting either pin.
+
+### Re-check at 06:06Z, 2026-11-28 — no lane moved
+
+**No pins moved.** This run re-read every lane at the head that carries the
+merged feedback control and found no newer eligible release, so the holds in
+[WI#916 note 23620](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23620)
+stand unchanged. Release times come from the npm packument's `latest`
+dist-tag and `time` map for Kimi, and from `git ls-remote --tags` on
+`anomalyco/opencode` with GitHub release `published_at` for both OpenCode
+lanes. Both OpenCode tags below still resolve directly to the commits shown.
+
+| Lane | Newest stable | Published (UTC) | 24-hour boundary (UTC) | Result |
+|---|---|---|---|---|
+| Kimi | `2.8.1` | 2026-11-26 11:55:36.675 | 2026-11-27 11:55:36.675 | Window closed; hold `2.7.2` (`kimicode4lunarwing/Dockerfile:3`) |
+| OpenCode 2 | `v2.4.2` at `fc31a485317970bcf6be7b431a9830aaef875731` | 2026-11-26 00:59:05 | 2026-11-27 00:59:05 | Window closed; hold `v2.3.2` at `c0ad18b402eb2827fc1ee71c171b1177b3fc02d1` (`opencode2.4lunarwing/Dockerfile:7-8`) |
+| OpenCode v1 | `v1.19.6` at `f4e363c8295fa90a03dddc451882fffe8fbce357` | 2026-11-17 07:21:32 | 2026-11-18 07:21:32 | Re-checked; no newer stable v1 tag, lane unchanged (`opencode4lunarwing/Dockerfile:13`) |
+
+Canary and pre-release builds were excluded; the only `canary` dist-tag is
+`2.9.0-canary.20261127130549-5304618`. Nothing was installed, built or run in
+this check. The `2.8.1` tarball still resolves to
+`https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.8.1.tgz`
+with `sha512-v64td7IvZp4Kd7LTNDs/KvTT/4QERkLNp2qZpJhYDOyb6ZwQDQgleo3qvTKbAg7nkWZjWx/ZNLhuhe2A+WLZqw==`,
+the value [note 23620](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/916#note_23620)
+verified against the downloaded tarball and the temporary lock; its Node
+requirement is still `>=22.19.0`. The committed lock
+(`kimicode4lunarwing/kimi-cli/package-lock.json`) is unchanged and still pins
+`2.7.2` at `https://registry.npmjs.org/@moonshot-ai/kimi-code/-/kimi-code-2.7.2.tgz`
+with `sha512-Eq7512ssQH632Tg7C1LIK10CykToqF2lpBdkFjJ1IjSV86fMjEHpwxuKoo6fjh5XpCbwtKwijB0hTTbyDRLM9w==`,
+matching `kimicode4lunarwing/kimi-cli/package.json`.
+
+**Why neither candidate is taken.** The blocking items are maintainer
+decisions, not verification gaps: the Kimi interaction/cross-session and
+trust/provider/persistence choices of note 23433, and the OpenCode 2 exposure
+choices, including what replaces the removed `mcp_events` gate. The feedback
+row is already decided (B) and implemented in both Kimi image stages by the
+patched `kimicode4lunarwing/scripts/disable_kimi_feedback.js`.
+
+**Measured on this revision.** `.gitlab/scripts/check-worker-exposure-policy.sh`
+(the `worker-exposure-policy-guard` job's command) exited 0 with both profiles
+passing — `opencode2` and `opencode-v1` — and 186 tests across 10 suites; it
+confirmed the forced `OPENCODE_FLAGS=-console_watches,-mcp_events,-artifacts`
+(`opencode2.4lunarwing/scripts/opencode-exposure-guard.sh:181`), the wrapper
+path in `entrypoint.sh`, and the managed policy. This is a retained-pin check,
+not a pass against either candidate. With no pin moved there is no bumped
+OpenCode image, so `console_policy_eval.py` against one is not applicable to
+this hold.
+
+**Green master pipeline.** The protected `master` pipeline for the merged
+feedback control is green: pipeline 8870 (`merge_request_event`) and 8869
+(`push`) both succeeded on `b94bbdf3237d`, the merge of
+`aragents/kimil00p/v2.2.3.0` into `master`. `master` still allows no direct
+push. This records the merge of the off control only; it is not acceptance of
+a bumped worker pin.
+
+**Unchanged guard inputs.** `KIMI_SERVICE_SUBCOMMANDS` still lists the same
+five listener spellings (`kimicode4lunarwing/hooks/headless_command_guard.mjs:4748`)
+and the task-env allowlist (`kimicode4lunarwing/scripts/kimi_task_executor.ts:72`)
+still has `2.8.1`'s names scrubbed by default, including
+`FEEDBACK_BASE_URL`. The hook deadline sentence at `:4430-4431` is
+unchanged and still matches the read CLI behavior: exit 2 blocks, while a
+hook error or CLI timeout can allow a call.
+
+**Record only — no bump.** The Pebble image fetches
+`nanogpt-community/pebble` (`pebble4lunarwing/Dockerfile:41`); its HEAD
+`2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` still equals the image pin
+`PEBBLE_REF` (`:1`). The LunarDepth lane reads
+`lunarwing/lunardepth` (`lunardepth4lunarwing/scripts/image_config_policy.py:55`);
+its HEAD `4106cd15771d8c94d73bab22541fb4a980390de8` remains ahead of the image
+pin `ca905dfe5e998ebcac29f5c57b5ea04108498468`. Neither ref moved in this
+check and neither is in scope for a bump.
+
+**Next step.** Resume only after the maintainer decides the two open lanes;
+then re-check the release windows, re-run the bump checklist
+(`:1296`) from the reviewed revision, and refresh the feedback patch's
+SHA-256 anchors and route anchors for the new bundle.

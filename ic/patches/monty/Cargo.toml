@@ -23,7 +23,7 @@ autotests = false
 autobenches = false
 description = "A sandboxed, snapshotable Python interpreter written in Rust."
 homepage = "https://github.com/pydantic/monty/"
-readme = "../../README.md"
+readme = "README.md"
 keywords = [
     "python",
     "interpreter",
@@ -174,6 +174,7 @@ version = "0.2"
 
 [dependencies.postcard]
 version = "1.1"
+default-features = false
 features = ["alloc"]
 
 [dependencies.ruff_python_ast]
