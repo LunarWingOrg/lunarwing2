@@ -4260,10 +4260,12 @@ fn read_attachments(paths: &[String]) -> Result<Vec<wit_channel::Attachment>, St
 mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use tracing_test::traced_test;
@@ -4484,6 +4486,13 @@ mod tests {
     }
 
     async fn create_real_weechat_channel(config_json: &str) -> WasmChannel {
+        create_real_weechat_channel_with_secrets(config_json, None).await
+    }
+
+    async fn create_real_weechat_channel_with_secrets(
+        config_json: &str,
+        secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
+    ) -> WasmChannel {
         let runtime =
             Arc::new(WasmChannelRuntime::new(WasmChannelRuntimeConfig::for_testing()).unwrap());
         let wasm_bytes =
@@ -4499,7 +4508,7 @@ mod tests {
         .expect("Failed to parse WeeChat capabilities")
         .to_capabilities();
 
-        WasmChannel::new(
+        let channel = WasmChannel::new(
             runtime,
             prepared,
             capabilities,
@@ -4507,7 +4516,12 @@ mod tests {
             config_json.to_string(),
             Arc::new(PairingStore::new()),
             None,
-        )
+        );
+        if let Some(secrets_store) = secrets_store {
+            channel.with_secrets_store(secrets_store)
+        } else {
+            channel
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -4577,6 +4591,110 @@ mod tests {
                 .expect("Mock WeeChat relay failed");
         });
         (format!("http://{address}"), requests, task)
+    }
+
+    struct RelayPasswordEnvGuard(Option<std::ffi::OsString>);
+
+    impl RelayPasswordEnvGuard {
+        fn without_managed_password() -> Self {
+            let previous = std::env::var_os("RELAY_PASSWORD");
+            unsafe {
+                std::env::remove_var("RELAY_PASSWORD");
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for RelayPasswordEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("RELAY_PASSWORD", value);
+                } else {
+                    std::env::remove_var("RELAY_PASSWORD");
+                }
+            }
+        }
+    }
+
+    async fn start_mock_weechat_auth_adapter() -> (
+        String,
+        Arc<Mutex<Vec<Option<String>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route(
+                "/api/version",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "weechat_version": "test",
+                        "relay_api_version": "2"
+                    }))
+                }),
+            )
+            .route(
+                "/api/buffers",
+                get(|| async { Json(serde_json::json!([])) }),
+            )
+            .route(
+                "/api/health",
+                get(|| async { Json(serde_json::json!({"event_cursor": 0})) }),
+            )
+            .route("/api/config", get(|| async { Json(serde_json::json!({})) }))
+            .route(
+                "/api/wait",
+                get(
+                    |State(requests): State<Arc<Mutex<Vec<Option<String>>>>>,
+                     headers: HeaderMap| async move {
+                        let authorization = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned);
+                        requests
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(authorization.clone());
+                        if authorization.as_deref() == Some("Basic cGxhaW46b2xk") {
+                            StatusCode::UNAUTHORIZED.into_response()
+                        } else {
+                            Json(serde_json::json!({"cursor": 1, "events": []})).into_response()
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&requests));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind mock WeeChat auth adapter");
+        let address = listener.local_addr().expect("Missing mock adapter address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Mock WeeChat auth adapter failed");
+        });
+        (format!("http://{address}"), requests, task)
+    }
+
+    async fn wait_for_weechat_wait_requests(
+        requests: &Arc<Mutex<Vec<Option<String>>>>,
+        expected_count: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let request_count = requests
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len();
+                if request_count >= expected_count {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("WeeChat wait request did not arrive in time");
     }
 
     #[test]
@@ -4787,6 +4905,108 @@ mod tests {
         }
 
         relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn weechat_wait_auth_failure_pauses_polling_until_secret_refresh() {
+        use crate::secrets::{CreateSecretParams, SecretsStore};
+
+        require_weechat_wasm!();
+        let _env_lock = crate::channels::wasm::WEECHAT_MANAGED_ENV_LOCK.lock().await;
+        let _relay_password_guard = RelayPasswordEnvGuard::without_managed_password();
+        let (adapter_url, requests, adapter_task) = start_mock_weechat_auth_adapter().await;
+        let secrets_store = Arc::new(crate::testing::credentials::test_secrets_store());
+        secrets_store
+            .create(
+                "default",
+                CreateSecretParams::new("weechat_relay_password", "old"),
+            )
+            .await
+            .expect("old WeeChat relay secret should be stored");
+        let secrets_store_trait: Arc<dyn SecretsStore + Send + Sync> = secrets_store.clone();
+        let config = serde_json::json!({
+            "display_name": "WeeChat",
+            "relay_url": adapter_url,
+            "relay_password": "old",
+            "connection_mode": "websocket",
+            "ws_adapter_url": adapter_url,
+            "dm_policy": "open",
+            "group_policy": "allowlist",
+            "poll_interval_seconds": 3
+        })
+        .to_string();
+        let mut channel =
+            create_real_weechat_channel_with_secrets(&config, Some(secrets_store_trait)).await;
+        channel.capabilities.min_poll_interval_ms = 3_000;
+
+        let _stream = channel.start().await.expect("WeeChat channel should start");
+        wait_for_weechat_wait_requests(&requests, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Err(error) = channel.health_check().await
+                    && error.to_string().contains("authentication rejected")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("HTTP 401 should mark the WeeChat channel unhealthy");
+
+        tokio::time::sleep(Duration::from_millis(3_200)).await;
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "polling should stay paused after the first rejected credential"
+        );
+
+        secrets_store
+            .create(
+                "default",
+                CreateSecretParams::new("weechat_relay_password", "new"),
+            )
+            .await
+            .expect("refreshed WeeChat relay secret should be stored");
+        channel
+            .set_credential("WEECHAT_RELAY_PASSWORD", "new".to_string())
+            .await;
+        channel
+            .call_on_start()
+            .await
+            .expect("WeeChat startup callback should refresh successfully");
+        wait_for_weechat_wait_requests(&requests, 2).await;
+
+        let recorded = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![
+                Some("Basic cGxhaW46b2xk".to_string()),
+                Some("Basic cGxhaW46bmV3".to_string())
+            ]
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if channel.health_check().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("successful poll with refreshed credentials should restore health");
+
+        channel
+            .shutdown()
+            .await
+            .expect("WeeChat channel should stop");
+        adapter_task.abort();
     }
 
     #[tokio::test]
