@@ -42,10 +42,11 @@ use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::WorkspaceError;
 use crate::workspace::{
     KnowledgeNoteMeta, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES, MAX_SLUG_BYTES,
     MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES,
-    WIRE_AGENT_PREFIX, Workspace, is_valid_slug, note_path, render_note_markdown,
+    MemoryDocument, WIRE_AGENT_PREFIX, Workspace, is_valid_slug, note_path, render_note_markdown,
 };
 
 /// Directory inside the lw2studymcp checkout holding source Markdown notes.
@@ -255,6 +256,13 @@ pub async fn run_additive_knowledge_import(
     report
 }
 
+/// One checkout note parsed and validated, ready to reconcile with the store.
+struct ParsedNote {
+    meta: KnowledgeNoteMeta,
+    markdown: String,
+    source_bytes: usize,
+}
+
 /// Import one checkout note into the private knowledge store.
 async fn seed_note(
     workspace: &Workspace,
@@ -262,12 +270,26 @@ async fn seed_note(
     allow_new_note: bool,
     remaining_bytes: usize,
 ) -> Result<SeedOutcome, String> {
-    let path = note_path(&note.agent, &note.topic);
-    let existing = workspace.read_primary(&path).await.ok();
     let raw =
         std::fs::read_to_string(&note.path).map_err(|error| format!("read failed: {error}"))?;
+    let parsed = parse_note(note, &raw)?;
+    let path = note_path(&note.agent, &note.topic);
+    let lookup = workspace.read_primary(&path).await;
+    apply_parsed_note(
+        workspace,
+        &path,
+        &parsed,
+        lookup,
+        allow_new_note,
+        remaining_bytes,
+    )
+    .await
+}
+
+/// Parse and validate one checkout note's title, body, and metadata.
+fn parse_note(note: &NoteFile, raw: &str) -> Result<ParsedNote, String> {
     let source_bytes = raw.len();
-    let (metadata_json, markdown) = split_note(&raw)?;
+    let (metadata_json, markdown) = split_note(raw)?;
     let (title, body) = extract_title(markdown, &note.topic);
     if title.len() > MAX_TITLE_BYTES {
         return Err(format!("title exceeds {MAX_TITLE_BYTES} UTF-8 bytes"));
@@ -279,41 +301,66 @@ async fn seed_note(
         return Err(format!("body exceeds {MAX_CONTENT_BYTES} UTF-8 bytes"));
     }
     let meta = build_meta(&note.agent, &note.topic, &title, metadata_json.as_ref())?;
-    let markdown = render_note_markdown(&title, &body);
+    Ok(ParsedNote {
+        meta,
+        markdown: render_note_markdown(&title, &body),
+        source_bytes,
+    })
+}
 
+/// Reconcile one parsed note with its primary-scope row.
+///
+/// `lookup` is the result of the primary-scope read. Only a confirmed
+/// `DocumentNotFound` may take the missing-row branch: any other lookup
+/// error is reported as a per-note failure so a storage fault can never be
+/// mistaken for an absent note and overwrite existing content.
+async fn apply_parsed_note(
+    workspace: &Workspace,
+    path: &str,
+    parsed: &ParsedNote,
+    lookup: Result<MemoryDocument, WorkspaceError>,
+    allow_new_note: bool,
+    remaining_bytes: usize,
+) -> Result<SeedOutcome, String> {
+    let existing = match lookup {
+        Ok(document) => Some(document),
+        Err(WorkspaceError::DocumentNotFound { .. }) => None,
+        Err(error) => return Err(format!("lookup failed: {error}")),
+    };
+    let meta_json = parsed.meta.to_metadata_json();
     if let Some(existing) = existing {
         if KnowledgeNoteMeta::from_metadata_json(&existing.metadata).is_some() {
             return Ok(SeedOutcome::AlreadyExists);
         }
-        if existing.content == markdown {
+        if existing.content == parsed.markdown {
             workspace
-                .set_document_metadata(&path, &meta.to_metadata_json())
+                .set_document_metadata(path, &meta_json)
                 .await
                 .map_err(|error| format!("metadata repair failed: {error}"))?;
         } else if existing.content.trim().is_empty() {
             workspace
-                .write(&path, &markdown)
+                .write(path, &parsed.markdown)
                 .await
                 .map_err(|error| format!("stranded-row write failed: {error}"))?;
             workspace
-                .set_document_metadata(&path, &meta.to_metadata_json())
+                .set_document_metadata(path, &meta_json)
                 .await
                 .map_err(|error| format!("metadata repair failed: {error}"))?;
         }
         return Ok(SeedOutcome::AlreadyExists);
     }
-    if !allow_new_note || source_bytes > remaining_bytes {
+    if !allow_new_note || parsed.source_bytes > remaining_bytes {
         return Ok(SeedOutcome::Deferred);
     }
     workspace
-        .write(&path, &markdown)
+        .write(path, &parsed.markdown)
         .await
         .map_err(|error| format!("write failed: {error}"))?;
     workspace
-        .set_document_metadata(&path, &meta.to_metadata_json())
+        .set_document_metadata(path, &meta_json)
         .await
         .map_err(|error| format!("metadata write failed: {error}"))?;
-    Ok(SeedOutcome::Seeded(source_bytes))
+    Ok(SeedOutcome::Seeded(parsed.source_bytes))
 }
 
 /// Enumerate importable note files, sorted for a deterministic pass order.
