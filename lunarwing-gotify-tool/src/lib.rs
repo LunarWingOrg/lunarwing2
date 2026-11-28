@@ -76,8 +76,8 @@ impl tool::Guest for GotifyTool {
     },
     "priority": {
       "type": "integer",
-      "description": "Priority: 1-3=low, 5-7=medium, 8-10=high. Default 3.",
-      "default": 3
+      "description": "Priority: 1-3=low, 5-7=medium, 8-10=high. Default 9.",
+      "default": 9
     }
   },
   "required": ["message"]
@@ -86,7 +86,7 @@ impl tool::Guest for GotifyTool {
     }
 
     fn description() -> String {
-        "Send a push notification via Gotify. Parameters (JSON object): message (string, REQUIRED), title (string, default: configurable via config/gotify.json or 'LunarWing'), priority (integer: 1-3=low, 5-7=medium, 8-10=high, default: 3). Example: {\"message\": \"hello\", \"priority\": 5}".to_string()
+        "Send a push notification via Gotify. Parameters (JSON object): message (string, REQUIRED), title (string, default: configurable via config/gotify.json or 'LunarWing'), priority (integer: 1-3=low, 5-7=medium, 8-10=high, default: 9). Example: {\"message\": \"hello\", \"priority\": 5}".to_string()
     }
 }
 
